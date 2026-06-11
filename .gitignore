@@ -1,0 +1,22 @@
+node_modules/
+dist/
+coverage/
+*.log
+*.tgz
+.DS_Store
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+
+# Live-dev e2e harness — operator-supplied fixtures and credentials must never be committed
+test/dev-e2e/fixtures.local.json
+test/dev-e2e/.env.local
+
+# CLI artifact downloads (default output dir for test artifact get)
+.testsprite/
+
+# Per-session Claude Code worktrees (parallel-session scratch space). Other
+# `.claude/` content (e.g., `skills/`) stays tracked.
+.claude/worktrees/

@@ -1,0 +1,8 @@
+dist/
+coverage/
+node_modules/
+*.tgz
+package-lock.json
+.claude/worktrees/
+
+

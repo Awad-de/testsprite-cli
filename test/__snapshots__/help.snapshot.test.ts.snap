@@ -1,0 +1,600 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`--help snapshots > agent 1`] = `
+"Usage: testsprite agent [options] [command]
+
+Install TestSprite guidance into coding-agent config (Claude Code, Cursor,
+Cline, Antigravity, Codex)
+
+Options:
+  -h, --help         display help for command
+
+Commands:
+  install [options]  Write the TestSprite verification-loop skill file into a
+                     project for a coding agent
+  list               List supported agent targets, their status, and landing
+                     paths
+  help [command]     display help for command
+"
+`;
+
+exports[`--help snapshots > agent install 1`] = `
+"Usage: testsprite agent install [options]
+
+Write the TestSprite verification-loop skill file into a project for a coding
+agent
+
+Options:
+  --target <t>  Agent target(s): claude, cursor, cline, antigravity, codex
+                (comma-separated or repeated) (default: [])
+  --dir <path>  Project root to write into (default: cwd)
+  --force       For own-file targets: overwrite existing file (a .bak backup is
+                kept). For codex (managed-section): replaces the section
+                unconditionally; user content outside the section is never
+                destroyed.
+  -h, --help    display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > agent list 1`] = `
+"Usage: testsprite agent list [options]
+
+List supported agent targets, their status, and landing paths
+
+Options:
+  -h, --help  display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > auth 1`] = `
+"Usage: testsprite auth [options] [command]
+
+Manage TestSprite credentials
+
+Options:
+  -h, --help           display help for command
+
+Commands:
+  configure [options]  Configure an API key for the active profile
+  whoami|status        Show the user, API key, and scopes bound to the active
+                       profile
+  logout               Remove credentials for the active profile
+  help [command]       display help for command
+"
+`;
+
+exports[`--help snapshots > auth configure 1`] = `
+"Usage: testsprite auth configure [options]
+
+Configure an API key for the active profile
+
+Options:
+  --from-env  Read TESTSPRITE_API_KEY (and optionally TESTSPRITE_API_URL) from
+              the environment instead of prompting (default: false)
+  -h, --help  display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > auth logout 1`] = `
+"Usage: testsprite auth logout [options]
+
+Remove credentials for the active profile
+
+Options:
+  -h, --help  display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > auth whoami 1`] = `
+"Usage: testsprite auth whoami|status [options]
+
+Show the user, API key, and scopes bound to the active profile
+
+Options:
+  -h, --help  display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > init 1`] = `
+"Usage: testsprite init [options]
+
+One-shot onboarding: configure an API key and install the coding-agent skill
+
+Options:
+  --api-key <key>   API key to configure (skips the interactive prompt)
+  --from-env        Read TESTSPRITE_API_KEY from the environment instead of
+                    prompting (default: false)
+  --agent <target>  Coding-agent target to install: claude, antigravity,
+                    cursor, cline, codex (default: claude) (default: "claude")
+  --no-agent        Skip the agent skill install (configure credentials only)
+  --force           Overwrite an existing skill file (a .bak backup is kept)
+  --dir <path>      Project root for the skill install (default: current
+                    directory)
+  -y, --yes         Non-interactive: accept all defaults, never prompt
+  -h, --help        display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > project 1`] = `
+"Usage: testsprite project [options] [command]
+
+Manage TestSprite projects
+
+Options:
+  -h, --help                     display help for command
+
+Commands:
+  list [options]                 List projects visible to the API key
+  
+  Exit codes:
+    0  success
+    3  auth error
+    5  validation error (e.g., bad --page-size)
+   10  transport/network failure (UNAVAILABLE) — retry the command
+  get <project-id>               Get a project by id
+  create [options]               Create a new project
+  update [options] <project-id>  Update project metadata
+  help [command]                 display help for command
+"
+`;
+
+exports[`--help snapshots > project get 1`] = `
+"Usage: testsprite project get [options] <project-id>
+
+Get a project by id
+
+Options:
+  -h, --help  display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > project list 1`] = `
+"Usage: testsprite project list [options]
+
+List projects visible to the API key
+
+Exit codes:
+  0  success
+  3  auth error
+  5  validation error (e.g., bad --page-size)
+ 10  transport/network failure (UNAVAILABLE) — retry the command
+
+Options:
+  --page-size <n>           service page-size hint (1-100, default 25)
+  --starting-token <token>  opaque cursor from a previous list response
+  --max-items <n>           stop after this many items across auto-paged pages
+  -h, --help                display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test 1`] = `
+"Usage: testsprite test [options] [command]
+
+Inspect TestSprite tests
+
+Options:
+  -h, --help                            display help for command
+
+Commands:
+  list [options]                        List tests in a project
+  get <test-id>                         Get a test by id
+  create [options]                      Create a test from saved code
+                                        (--code-file) or an agent-supplied plan
+                                        (--plan-from, FE-only, M3.2 piece-5)
+  create-batch [options]                Create multiple FE tests from a JSONL
+                                        of plan specs (FE-only)
+  steps [options] <test-id>             List the steps for a test (server
+                                        returns the cumulative log across every
+                                        run; use --run-id to scope to one run)
+  result [options] <test-id>            Get the latest result for a test (default) or list prior runs (--history).
+  
+  --output json shape differs by mode:
+    (default)  single CliLatestResult object
+    --history  { runs: RunHistoryItem[], nextCursor: string|null }
+  
+  Per-run detail: testsprite test wait <run-id>
+  Failure bundle:  testsprite test artifact get <run-id>
+  update [options] <test-id>            Update test metadata — name,
+                                        description, priority
+  delete [options] <test-id>            Permanently delete a test. Requires
+                                        --confirm. (M3.2 piece-3)
+  delete-batch [options] [test-ids...]  Permanently delete multiple tests in one command. Requires --confirm.
+  Use --all --project <id> to delete all tests in a project (optionally filtered by --status).
+  
+  Prints a per-test summary (Deleted N, Skipped M, Failed K) to stdout.
+  
+  Exit codes:
+    0  all targeted tests deleted (or --dry-run)
+    1  one or more deletions failed (server error)
+    5  validation error (missing --confirm, missing --project with --all, etc.)
+  
+  Note: a 404 "not found" response is counted as skipped in the summary, not an error.
+  run [options] [test-id]               Trigger a test run. With --wait, polls until terminal status.
+  Use --all --project <id> for a wave-ordered batch run of all BE tests (M4).
+  
+  Exit codes:
+    0  passed (or queued without --wait)
+    1  failed / blocked / cancelled
+    3  auth error
+    4  test not found
+    5  validation error (e.g., bad --target-url, or positional + --all both set)
+    6  conflict (already running — see nextAction for the active runId)
+    7  timeout — resume with: testsprite test wait <run-id>
+   10  transport/network failure (UNAVAILABLE) — retry the command
+   11  rate limited — honor Retry-After
+  
+  On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
+  wait [options] <run-id>               Wait for a run to reach a terminal status.
+  
+  Exit codes:
+    0  passed
+    1  failed / blocked / cancelled
+    3  auth error
+    4  run not found
+    7  timeout — resume with: testsprite test wait <run-id>
+   10  transport/network failure (UNAVAILABLE) — retry the command
+  
+  On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
+  rerun [options] [test-ids...]         Re-execute a test (or multiple) as a cheap replay — FE replays the saved script (no credit), BE re-runs the dependency closure.
+  
+  Exit codes:
+    0  passed (or queued without --wait)
+    1  failed / blocked / cancelled
+    3  auth error
+    4  test not found
+    5  validation error
+    6  conflict (already running — see nextAction for the active runId)
+    7  timeout or deferred — resume with: testsprite test wait <run-id>
+   11  rate limited — honor Retry-After
+  
+  On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
+  code                                  Inspect and edit generated test code
+  plan                                  Manage FE test plan-steps (FE-only)
+  failure                               Export the latest-failure agent bundle
+  artifact                              Download run-scoped artifact bundles
+                                        (M3.3 piece-4)
+  help [command]                        display help for command
+"
+`;
+
+exports[`--help snapshots > test code get 1`] = `
+"Usage: testsprite test code get [options] <test-id>
+
+Print the generated test code
+
+Options:
+  --out <path>  Write the response to this file instead of stdout (text mode:
+                source body; json mode: wire envelope)
+  -h, --help    display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test create-batch 1`] = `
+"Usage: testsprite test create-batch [options]
+
+Create multiple FE tests from a JSONL of plan specs (FE-only)
+
+Options:
+  --plans <path>             JSONL file with one plan-from spec per line (≤ 50
+                             specs, ≤ 5 MB)
+  --plan-from-dir <dir>      directory of *.json plan files — each file is one
+                             plan spec (≤ 50 files, ≤ 5 MB total). Sorted by
+                             filename for determinism. Mutually exclusive with
+                             --plans.
+  --run                      after create, trigger each created test as a run
+                             (default: false)
+  --max-concurrency <n>      with --run, max in-flight triggers at once (1-100,
+                             default: 50). The server caps run-triggers at
+                             60/min/key; the CLI throttles to 50/min and
+                             auto-retries RATE_LIMITED responses client-side —
+                             raising this value does not bypass the server cap.
+  --wait                     with --run, poll each run until terminal status
+                             (default: false)
+  --timeout <s>              with --run --wait, per-run max seconds to wait
+                             (1-3600, default 600)
+  --target-url <url>         with --run, override the project default env URL
+                             for each run
+  --idempotency-key <token>  opaque idempotency token for the batch create
+                             (1-256 ASCII chars). Defaults to a UUIDv4 minted
+                             per invocation; pin one yourself for safe retries.
+  -h, --help                 display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test failure get 1`] = `
+"Usage: testsprite test failure get [options] <test-id>
+
+Write a self-contained failure-context bundle for a test's latest failing run
+
+Options:
+  --out <dir>    Directory to write the §7 disk layout into (default: print
+                 wire envelope to stdout)
+  --failed-only  Keep only the failed step plus its immediate neighbors (±1)
+  -h, --help     display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test get 1`] = `
+"Usage: testsprite test get [options] <test-id>
+
+Get a test by id
+
+Options:
+  -h, --help  display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test list 1`] = `
+"Usage: testsprite test list [options]
+
+List tests in a project
+
+Options:
+  --project <id>            project id (returned by \`testsprite project list\`)
+  --type <type>             filter by test type (frontend|backend)
+  --created-from <source>   filter by where the test was authored
+                            (portal|mcp|cli)
+  --status <list>           filter by normalized status (comma-separated). One
+                            of: draft, ready, queued, running, passed, failed,
+                            blocked, cancelled, unknown — M2.1
+  --page-size <n>           service page-size hint (1-100, default 25)
+  --starting-token <token>  opaque cursor from a previous list response
+  --cursor <token>          alias for --starting-token; accepted for parity
+                            with \`test result --history\`
+  --max-items <n>           stop after this many items across auto-paged pages
+  -h, --help                display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test rerun 1`] = `
+"Usage: testsprite test rerun [options] [test-ids...]
+
+Re-execute a test (or multiple) as a cheap replay — FE replays the saved script (no credit), BE re-runs the dependency closure.
+
+Exit codes:
+  0  passed (or queued without --wait)
+  1  failed / blocked / cancelled
+  3  auth error
+  4  test not found
+  5  validation error
+  6  conflict (already running — see nextAction for the active runId)
+  7  timeout or deferred — resume with: testsprite test wait <run-id>
+ 11  rate limited — honor Retry-After
+
+On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
+
+Options:
+  --all                    rerun all tests in the resolved project (requires
+                           --project) (default: false)
+  --project <id>           project id (required with --all; returned by
+                           \`testsprite project list\`)
+  --skip-terminal          with --all: skip tests already in a terminal status
+                           (passed|failed|blocked|cancelled) (default: false)
+  --status <list>          with --all: only dispatch tests whose status matches
+                           one of these values (comma-separated; accepted:
+                           draft|ready|queued|running|passed|failed|blocked|cancelled|unknown)
+  --filter <substr>        with --all: only rerun tests whose name contains
+                           this substring (case-insensitive)
+  --wait                   block until terminal status or --timeout elapses
+                           (default: false)
+  --timeout <s>            with --wait, max seconds to wait (1–3600, default
+                           600)
+  --no-auto-heal           opt out of AI heal-on-drift for this FE rerun
+                           (default: auto-heal is ON). Costs 0.2 credits per
+                           engage when a step has drifted. Ignored for backend
+                           tests.
+  --skip-dependencies      BE only: rerun only the named test without expanding
+                           the producer/teardown closure (default: false)
+  --max-concurrency <n>    with --wait, max in-flight polls at once (1-100,
+                           default: 50)
+  --idempotency-key <key>  opaque key for safe retries (1–256 chars). Printed
+                           to stderr at --verbose if auto-generated.
+  -h, --help               display help for command
+
+Notes:
+  • rerun replays a saved run/script and is MORE LENIENT than a fresh \`test run\`
+    (auto-heal can pass steps that have drifted) — for strict scoring/regression,
+    prefer \`test run\`. The two are not interchangeable for pass-rate measurement.
+  • Under --wait the per-request HTTP timeout is auto-raised to cover --timeout so a
+    slow trigger/poll under load is not cut at the 120s default (see --request-timeout).
+  • Batch --wait: rate-deferred tests appear in \`deferred[]\` and \`summary.deferred\`,
+    and force a non-zero exit — they are NOT counted in \`summary.total\` (dispatched only).
+
+Dry-run shape notes:
+  • --dry-run shows the BE rerun wire shape (includes \`closure{}\`); FE rerun responses
+    omit \`closure\` (or return it as null) since there is no dependency expansion.
+  • \`autoHeal\` defaults true for FE reruns; BE reruns ignore the field entirely.
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test result 1`] = `
+"Usage: testsprite test result [options] <test-id>
+
+Get the latest result for a test (default) or list prior runs (--history).
+
+--output json shape differs by mode:
+  (default)  single CliLatestResult object
+  --history  { runs: RunHistoryItem[], nextCursor: string|null }
+
+Per-run detail: testsprite test wait <run-id>
+Failure bundle:  testsprite test artifact get <run-id>
+
+Options:
+  --include-analysis  attach the inline \`analysis\` block (rootCauseHypothesis,
+                      recommendedFixTarget, failureKind, snapshotId) — M2.1
+                      (default: false)
+  --history           list prior runs for this test instead of showing the
+                      latest result
+  --source <src>      with --history: filter by trigger source
+                      (cli|portal|mcp|schedule|github_action)
+  --since <dur>       with --history: lower bound on createdAt — 24h, 7d, or
+                      ISO timestamp (client-side translated)
+  --page-size <n>     with --history: number of runs per page (1–100, default
+                      20)
+  --cursor <token>    with --history: opaque cursor from a prior page
+  -h, --help          display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test run 1`] = `
+"Usage: testsprite test run [options] [test-id]
+
+Trigger a test run. With --wait, polls until terminal status.
+Use --all --project <id> for a wave-ordered batch run of all BE tests (M4).
+
+Exit codes:
+  0  passed (or queued without --wait)
+  1  failed / blocked / cancelled
+  3  auth error
+  4  test not found
+  5  validation error (e.g., bad --target-url, or positional + --all both set)
+  6  conflict (already running — see nextAction for the active runId)
+  7  timeout — resume with: testsprite test wait <run-id>
+ 10  transport/network failure (UNAVAILABLE) — retry the command
+ 11  rate limited — honor Retry-After
+
+On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
+
+Options:
+  --target-url <url>       override the project default env URL for this run
+                           (http/https only, no localhost/private IPs)
+  --wait                   poll until terminal status or --timeout elapses
+                           (default: false)
+  --timeout <s>            with --wait, max seconds to wait (1–3600, default
+                           600)
+  --idempotency-key <key>  opaque key for safe retries (1–256 chars). Printed
+                           to stderr at --debug if auto-generated.
+  --all                    run all BE tests in the project (wave-ordered fresh
+                           run; requires --project). Mutually exclusive with
+                           <test-id>. (default: false)
+  --project <id>           project id (required with --all; returned by
+                           \`testsprite project list\`)
+  --filter <substr>        with --all: only run tests whose name contains this
+                           substring (case-insensitive)
+  --max-concurrency <n>    with --all --wait, max in-flight polls at once
+                           (1-100, default: 50)
+  -h, --help               display help for command
+
+Dependency-aware fresh run (M4):
+  testsprite test run --all --project <id>           run all BE tests in wave order
+  testsprite test run --all --project <id> --filter <substr>  name-glob subset
+
+BE tests can declare --produces/--needs at create time to drive wave ordering
+(see \`testsprite test create --help\` for details).
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test steps 1`] = `
+"Usage: testsprite test steps [options] <test-id>
+
+List the steps for a test (server returns the cumulative log across every run;
+use --run-id to scope to one run)
+
+Options:
+  --page-size <n>           service page size hint (1-100, default 25)
+  --max-items <n>           stop after this many items across auto-paged pages
+  --starting-token <token>  opaque cursor from a previous response
+  --run-id <id>             Filter steps to those belonging to the specified
+                            runId. Useful for tests that have been run multiple
+                            times — by default 'test steps' returns the
+                            cumulative log across every run. Note: legacy step
+                            records (pre-M3.1) with null runIdIfAvailable are
+                            excluded when this flag is set.
+  -h, --help                display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > top 1`] = `
+"Usage: testsprite [options] [command]
+
+Official TestSprite command-line interface
+
+Options:
+  -V, --version                output the version number
+  --output <mode>              Output format (json|text) (default: "text")
+  --profile <name>             Configuration profile to use
+  --endpoint-url <url>         Override the API endpoint host
+  --verbose                    Emit human-readable HTTP retry / backoff /
+                               polling-mode transitions to stderr. Less noisy
+                               than --debug; useful for diagnosing hangs
+                               without the full trace.
+  --debug                      Print HTTP method/path, request id, latency,
+                               retry decisions to stderr
+  --dry-run                    Skip the network, credentials, and filesystem;
+                               emit a canned sample matching the OpenAPI
+                               contract. Useful for learning the CLI surface
+                               without an API key.
+  --request-timeout <seconds>  Client-side per-request timeout in seconds
+                               (default: 120). Aborts any single fetch that
+                               does not complete within this deadline. Override
+                               via TESTSPRITE_REQUEST_TIMEOUT_MS env var
+                               (milliseconds). Range: 1–600. Does not affect
+                               the --timeout polling ceiling for \`test
+                               run/wait\`.
+  -h, --help                   display help for command
+
+Commands:
+  agent                        Install TestSprite guidance into coding-agent
+                               config (Claude Code, Cursor, Cline, Antigravity,
+                               Codex)
+  auth                         Manage TestSprite credentials
+  init [options]               One-shot onboarding: configure an API key and
+                               install the coding-agent skill
+  project                      Manage TestSprite projects
+  test                         Inspect TestSprite tests
+  usage|credits                Show credit balance and plan/entitlement info
+                               (proactive pre-flight before a large test run)
+  help [command]               display help for command
+"
+`;
