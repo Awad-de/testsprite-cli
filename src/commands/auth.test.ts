@@ -268,8 +268,10 @@ describe('runConfigure', () => {
     expect(capture.stderr.join('\n')).toContain('profile NOT updated');
   });
 
-  // piece-3 bootstrap tip tests
-  it('piece-3 — text mode success emits the agent-install tip on stderr', async () => {
+  // The old "run `testsprite agent install`" self-bootstrap tip was removed with
+  // the setup consolidation — runConfigure now runs ONLY as part of `setup`,
+  // which installs the skill itself. These guard that the tip stays gone.
+  it('piece-3 — text mode success does NOT emit the agent-install tip', async () => {
     const { capture, deps } = makeCapture();
     await runConfigure(
       { profile: 'default', output: 'text', debug: false, fromEnv: true },
@@ -280,7 +282,7 @@ describe('runConfigure', () => {
         fetchImpl: meOkFetch,
       },
     );
-    expect(capture.stderr.join('\n')).toContain('agent install --target=claude');
+    expect(capture.stderr.join('\n')).not.toContain('agent install');
   });
 
   it('piece-3 — json mode success does NOT emit the agent-install tip', async () => {
@@ -536,6 +538,57 @@ describe('runConfigure', () => {
     expect(capture.stderr.join('\n')).toContain(
       '[advisory] Inheriting api_url from existing profile: https://api.example.com:8443',
     );
+  });
+
+  // Telemetry attribution: commandTag → X-CLI-Command header on the validate /me
+  // so the backend counts `init` onboarding as cli.initialized (not session_started).
+  it('sends X-CLI-Command on the validation /me when commandTag is set', async () => {
+    const { deps } = makeCapture();
+    const sentHeaders: Array<Record<string, string> | undefined> = [];
+    const capturingFetch = vi.fn(
+      async (_url: string, init: { headers?: Record<string, string> }) => {
+        sentHeaders.push(init?.headers);
+        return new Response(JSON.stringify(sampleMe), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    ) as unknown as AuthDeps['fetchImpl'];
+    await runConfigure(
+      { profile: 'default', output: 'json', debug: false, fromEnv: true },
+      {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: 'sk' },
+        credentialsPath,
+        fetchImpl: capturingFetch,
+        commandTag: 'init',
+      },
+    );
+    expect(sentHeaders.some(h => h?.['x-cli-command'] === 'init')).toBe(true);
+  });
+
+  it('omits X-CLI-Command when no commandTag (plain auth configure)', async () => {
+    const { deps } = makeCapture();
+    const sentHeaders: Array<Record<string, string> | undefined> = [];
+    const capturingFetch = vi.fn(
+      async (_url: string, init: { headers?: Record<string, string> }) => {
+        sentHeaders.push(init?.headers);
+        return new Response(JSON.stringify(sampleMe), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    ) as unknown as AuthDeps['fetchImpl'];
+    await runConfigure(
+      { profile: 'default', output: 'json', debug: false, fromEnv: true },
+      {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: 'sk' },
+        credentialsPath,
+        fetchImpl: capturingFetch,
+      },
+    );
+    expect(sentHeaders.every(h => h?.['x-cli-command'] === undefined)).toBe(true);
   });
 });
 
@@ -861,23 +914,42 @@ describe('createAuthCommand wiring', () => {
     errorSpy.mockRestore();
   });
 
-  it('exposes the expected subcommands', () => {
+  it('exposes status/remove as primaries plus deprecated whoami/logout aliases', () => {
     const auth = createAuthCommand();
-    expect(auth.commands.map(c => c.name()).sort()).toEqual(['configure', 'logout', 'whoami']);
+    // `configure` is NOT here — it is a hidden, program-level alias for `setup`
+    // (attached in index.ts) so it can route through the setup flow.
+    expect(auth.commands.map(c => c.name()).sort()).toEqual([
+      'logout',
+      'remove',
+      'status',
+      'whoami',
+    ]);
   });
 
-  it('configure --from-env writes the profile and exits 0', async () => {
+  it('remove deletes the active profile and exits 0', async () => {
+    writeProfile('default', { apiKey: 'sk-remove' }, { path: credentialsPath });
     const { deps } = makeCapture();
+    const auth = createAuthCommand({ ...deps, credentialsPath });
+    auth.exitOverride();
+    auth.commands.forEach(c => c.exitOverride());
+    await auth.parseAsync(['remove'], { from: 'user' });
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+  });
+
+  it('deprecated `whoami` alias emits a deprecation notice pointing at `auth status`', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
     const auth = createAuthCommand({
       ...deps,
-      env: { TESTSPRITE_API_KEY: 'sk-wired' },
       credentialsPath,
+      env: {},
       fetchImpl: meOkFetch,
     });
     auth.exitOverride();
     auth.commands.forEach(c => c.exitOverride());
-    await auth.parseAsync(['configure', '--from-env'], { from: 'user' });
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-wired');
+    await auth.parseAsync(['whoami'], { from: 'user' });
+    expect(capture.stderr.join('\n')).toContain('[deprecated]');
+    expect(capture.stderr.join('\n')).toContain('auth status');
   });
 
   it('whoami uses injected fetch and exits 0', async () => {

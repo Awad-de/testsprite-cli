@@ -826,3 +826,37 @@ describe('[B-E2E-06] runInit: install failure → info message on stderr + re-th
     expect(infoLine).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// 11. Telemetry attribution — X-CLI-Command header (cli.initialized)
+// ---------------------------------------------------------------------------
+
+describe('runInit — telemetry attribution (X-CLI-Command)', () => {
+  it('tags the configure /me with X-CLI-Command: init exactly once; whoami /me is untagged', async () => {
+    const { deps } = makeCapture();
+    // Capture the headers of every outgoing request so we can assert which /me
+    // calls carry the init attribution tag.
+    const sentHeaders: Array<Record<string, string> | undefined> = [];
+    const fetchMock = vi.fn(async (_url: string, init: { headers?: Record<string, string> }) => {
+      sentHeaders.push(init.headers);
+      return new Response(JSON.stringify(ME), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as InitDeps['fetchImpl'];
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-tag', noAgent: true, output: 'json' }), {
+      ...deps,
+      fetchImpl: fetchMock,
+      credentialsPath,
+      isTTY: false,
+    });
+
+    // init drives two GET /me calls: configure-validate + whoami banner.
+    expect(sentHeaders.length).toBeGreaterThanOrEqual(2);
+    const initTagged = sentHeaders.filter(h => h?.['x-cli-command'] === 'init');
+    // Exactly one carries the tag → the backend emits exactly one cli.initialized
+    // (no double-count); the whoami /me stays cli.session_started.
+    expect(initTagged).toHaveLength(1);
+  });
+});

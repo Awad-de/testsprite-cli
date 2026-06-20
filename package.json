@@ -1,6 +1,6 @@
 {
   "name": "@testsprite/testsprite-cli",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Official TestSprite command-line interface",
   "type": "module",
   "main": "dist/index.js",
@@ -9,9 +9,12 @@
   },
   "files": [
     "dist",
+    "skills",
     "!dist/**/*.map"
   ],
   "scripts": {
+    "generate:version": "node scripts/generate-version.mjs",
+    "prebuild": "node scripts/generate-version.mjs",
     "build": "tsc -p tsconfig.build.json && node scripts/postbuild.mjs",
     "clean": "rm -rf dist coverage",
     "lint": "eslint .",

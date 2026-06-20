@@ -48,7 +48,7 @@ testsprite project list --dry-run --output json
 
 ## Manual setup
 
-The recommended path is `testsprite init` (see the [README quickstart](./README.md#quickstart)). If you prefer to configure each step separately:
+The recommended path is `testsprite setup` (see the [README quickstart](./README.md#quickstart)). If you prefer to configure each step separately:
 
 ### 1. Authenticate
 

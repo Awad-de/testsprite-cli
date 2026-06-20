@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ErrorCode } from './errors.js';
 import { ApiError, RequestTimeoutError, TransportError } from './errors.js';
+import { VERSION } from '../version.js';
 import type {
   TriggerRunBody,
   TriggerRunResponse,
@@ -612,7 +613,7 @@ export class HttpClient {
     const headers: Record<string, string> = {
       'x-request-id': requestId,
       accept: 'application/json',
-      'user-agent': 'testsprite-cli',
+      'user-agent': `testsprite-cli/${VERSION}`,
     };
     // The CLI v1 facade authenticates via `x-api-key`.
     // (securitySchemes.ApiKeyAuth). Sending only Authorization Bearer would be

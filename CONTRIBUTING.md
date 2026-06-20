@@ -33,9 +33,7 @@ npm run test:coverage  # Vitest with v8 coverage (>= 80% gate)
 ```
 
 Unit tests are mock-based and run with no external dependencies — this is the
-suite contributors run locally and in CI. A separate live end-to-end suite
-(`npm run test:dev`) runs against an internal TestSprite backend and requires
-maintainer credentials; it is not needed to contribute.
+full suite contributors need to run locally and in CI.
 
 ## Lint, format, and type-check
 

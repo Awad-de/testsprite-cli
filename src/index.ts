@@ -2,13 +2,18 @@
 import { Command, CommanderError } from 'commander';
 import { createAgentCommand } from './commands/agent.js';
 import { createAuthCommand } from './commands/auth.js';
-import { createInitCommand } from './commands/init.js';
+import {
+  createDeprecatedInitCommand,
+  createSetupCommand,
+  runConfigureViaSetup,
+} from './commands/init.js';
 import { createProjectCommand } from './commands/project.js';
 import { createTestCommand } from './commands/test.js';
 import { createUsageCommand } from './commands/usage.js';
 import { ApiError, CLIError, RequestTimeoutError } from './lib/errors.js';
 import { Output, isOutputMode } from './lib/output.js';
 import { rephraseUnknownOption } from './lib/render-error.js';
+import { maybeEmitSkillNudge } from './lib/skill-nudge.js';
 import { VERSION } from './version.js';
 
 const program = new Command();
@@ -41,11 +46,35 @@ program
       'Range: 1–600. Does not affect the --timeout polling ceiling for `test run/wait`.',
   );
 
-program.addCommand(createAgentCommand({}));
-program.addCommand(createAuthCommand());
-program.addCommand(createInitCommand({}));
+// `setup` is the primary onboarding command, listed FIRST in --help so a coding
+// agent reaches it before anything else. `init` is kept as a hidden, deprecated
+// alias (invisible to --help; still works for existing scripts/agents).
+program.addCommand(createSetupCommand({}));
+program.addCommand(createDeprecatedInitCommand({}), { hidden: true });
+
+// `auth configure` is a hidden, deprecated alias that runs FULL `setup`
+// (configure + skill install), so an agent reaching for the old command still
+// ends up with the skill. `setup` remains the ONLY path that writes credentials.
+const authCommand = createAuthCommand();
+authCommand
+  .command('configure', { hidden: true })
+  .option(
+    '--from-env',
+    'Read TESTSPRITE_API_KEY (and optionally TESTSPRITE_API_URL) from the environment instead of prompting',
+    false,
+  )
+  .action(async (cmdOpts: { fromEnv?: boolean }, command: Command) => {
+    process.stderr.write(
+      '[deprecated] `testsprite auth configure` now runs full setup (configure + skill install) — ' +
+        'use `testsprite setup` (add --no-agent to skip the skill).\n',
+    );
+    await runConfigureViaSetup(command, {}, Boolean(cmdOpts.fromEnv));
+  });
+program.addCommand(authCommand);
+
 program.addCommand(createProjectCommand({}));
 program.addCommand(createTestCommand());
+program.addCommand(createAgentCommand({}));
 program.addCommand(createUsageCommand());
 
 // Propagate exitOverride to every subcommand in the tree.
@@ -67,6 +96,41 @@ program.configureOutput({
     const rephrased = rephraseUnknownOption(str);
     write(rephrased !== null ? `${rephrased}\n` : str);
   },
+});
+
+/**
+ * Render a leaf command's full path (group + leaf), e.g. `test run` /
+ * `auth whoami`, by walking parents up to (but not including) the root program.
+ */
+function commandPathOf(cmd: Command): string {
+  const names: string[] = [];
+  let cur: Command | null = cmd;
+  while (cur && cur.parent) {
+    names.unshift(cur.name());
+    cur = cur.parent;
+  }
+  return names.join(' ');
+}
+
+// Best-effort onboarding nudge (see lib/skill-nudge.ts): when a configured
+// caller drives a verify-loop command in a project with no installed skill,
+// point it at `testsprite setup`. A preAction hook runs before every leaf
+// action; the helper self-gates (text-only, non-dry-run, a small command
+// allowlist, opt-out via TESTSPRITE_NO_SKILL_WARNING) and never throws.
+program.hook('preAction', (_thisCommand, actionCommand) => {
+  const globals = actionCommand.optsWithGlobals() as {
+    output?: string;
+    profile?: string;
+    dryRun?: boolean;
+  };
+  maybeEmitSkillNudge({
+    commandPath: commandPathOf(actionCommand),
+    output: isOutputMode(globals.output) ? globals.output : 'text',
+    dryRun: globals.dryRun ?? false,
+    profile: globals.profile ?? 'default',
+    cwd: process.cwd(),
+    env: process.env,
+  });
 });
 
 try {

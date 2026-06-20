@@ -120,7 +120,7 @@ describe('ApiError.authRequired', () => {
     const err = ApiError.authRequired();
     expect(err.code).toBe('AUTH_REQUIRED');
     expect(err.exitCode).toBe(3);
-    expect(err.nextAction).toContain('testsprite auth configure');
+    expect(err.nextAction).toContain('testsprite setup');
   });
 
   it('P9 — nextAction mentions --from-env for non-interactive flows', () => {

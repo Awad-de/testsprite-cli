@@ -377,9 +377,9 @@ function runCli(args: string[], envOverrides: Record<string, string> = {}): Prom
   });
 }
 
-describe('auth whoami subprocess', () => {
+describe('auth status subprocess (+ deprecated whoami alias)', () => {
   it('prints JSON me and exits 0 against the local server', async () => {
-    const result = await runCli(['auth', 'whoami', '--output', 'json'], {
+    const result = await runCli(['auth', 'status', '--output', 'json'], {
       TESTSPRITE_API_KEY: 'sk-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
@@ -390,16 +390,16 @@ describe('auth whoami subprocess', () => {
   }, 30_000);
 
   it('exits 3 with AUTH_REQUIRED when no key is configured (text mode)', async () => {
-    const result = await runCli(['auth', 'whoami'], {
+    const result = await runCli(['auth', 'status'], {
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(3);
     expect(result.stderr).toContain('Authentication is required.');
-    expect(result.stderr).toContain('testsprite auth configure');
+    expect(result.stderr).toContain('testsprite setup');
   }, 30_000);
 
   it('--output json emits a parseable error envelope on AUTH_REQUIRED', async () => {
-    const result = await runCli(['--output', 'json', 'auth', 'whoami'], {
+    const result = await runCli(['--output', 'json', 'auth', 'status'], {
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(3);
@@ -407,11 +407,11 @@ describe('auth whoami subprocess', () => {
       error: { code: string; nextAction: string; requestId: string };
     };
     expect(parsed.error.code).toBe('AUTH_REQUIRED');
-    expect(parsed.error.nextAction).toContain('testsprite auth configure');
+    expect(parsed.error.nextAction).toContain('testsprite setup');
   }, 30_000);
 
   it('text mode renders userId/scopes legibly', async () => {
-    const result = await runCli(['auth', 'whoami'], {
+    const result = await runCli(['auth', 'status'], {
       TESTSPRITE_API_KEY: 'sk-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
@@ -421,7 +421,7 @@ describe('auth whoami subprocess', () => {
   }, 30_000);
 
   it('--debug emits structured debug events to stderr without leaking the key', async () => {
-    const result = await runCli(['--debug', 'auth', 'whoami', '--output', 'json'], {
+    const result = await runCli(['--debug', 'auth', 'status', '--output', 'json'], {
       TESTSPRITE_API_KEY: 'sk-subproc-secret',
       TESTSPRITE_API_URL: baseUrl,
     });
@@ -430,6 +430,17 @@ describe('auth whoami subprocess', () => {
     expect(result.stderr).toContain('"kind":"response"');
     expect(result.stderr).not.toContain('sk-subproc-secret');
     expect(result.stderr).not.toContain('x-api-key');
+  }, 30_000);
+
+  it('deprecated `auth whoami` alias still works and prints a deprecation notice', async () => {
+    const result = await runCli(['auth', 'whoami', '--output', 'json'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(ME_BODY);
+    expect(result.stderr).toContain('[deprecated]');
+    expect(result.stderr).toContain('auth status');
   }, 30_000);
 });
 
@@ -768,24 +779,24 @@ describe('test result subprocess', () => {
   }, 30_000);
 });
 
-describe('auth logout subprocess', () => {
+describe('auth remove subprocess', () => {
   it('removes the profile file entry and exits 0', async () => {
-    // First configure a profile
-    const configureResult = await runCli(['auth', 'configure', '--from-env'], {
+    // First configure a profile (via the consolidated `setup` path)
+    const configureResult = await runCli(['setup', '--from-env', '--no-agent'], {
       TESTSPRITE_API_KEY: 'sk-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(configureResult.exitCode).toBe(0);
 
-    const logoutResult = await runCli(['auth', 'logout']);
-    expect(logoutResult.exitCode).toBe(0);
-    expect(logoutResult.stdout).toContain('Removed credentials');
+    const removeResult = await runCli(['auth', 'remove']);
+    expect(removeResult.exitCode).toBe(0);
+    expect(removeResult.stdout).toContain('Removed credentials');
   }, 30_000);
 });
 
-describe('auth configure --from-env subprocess', () => {
+describe('setup --from-env subprocess', () => {
   it('writes the credentials file with mode 0600', async () => {
-    const result = await runCli(['auth', 'configure', '--from-env'], {
+    const result = await runCli(['setup', '--from-env', '--no-agent'], {
       TESTSPRITE_API_KEY: 'sk-mode-test',
       TESTSPRITE_API_URL: baseUrl,
     });
@@ -797,7 +808,7 @@ describe('auth configure --from-env subprocess', () => {
 
   it('exits 5 with VALIDATION_ERROR when --from-env is set without TESTSPRITE_API_KEY', async () => {
     // Explicitly do not pass TESTSPRITE_API_KEY
-    const result = await runCli(['auth', 'configure', '--from-env'], {
+    const result = await runCli(['setup', '--from-env', '--no-agent'], {
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(5);
@@ -924,15 +935,15 @@ describe('--dry-run subprocess smoke', () => {
     const credPath = join(tmpHome, '.testsprite', 'credentials');
     // Make sure any previous test didn't leave one behind.
     if (existsSync(credPath)) execFileSync('rm', [credPath]);
-    const result = await runCli(['auth', 'configure', '--dry-run', '--output', 'json']);
+    const result = await runCli(['setup', '--dry-run', '--no-agent', '--output', 'json']);
     expect(result.exitCode).toBe(0);
     expect(existsSync(credPath)).toBe(false);
     expect(result.stderr).toContain('[dry-run]');
-    expect(result.stderr).toContain('would write credentials');
+    expect(result.stderr).toContain('would configure profile');
   }, 30_000);
 
   it('auth whoami --dry-run returns canned MeResponse without auth', async () => {
-    const result = await runCli(['auth', 'whoami', '--dry-run', '--output', 'json']);
+    const result = await runCli(['auth', 'status', '--dry-run', '--output', 'json']);
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(result.stdout) as { userId: string; scopes: string[] };
     expect(parsed.userId).toBeTruthy();
@@ -941,14 +952,14 @@ describe('--dry-run subprocess smoke', () => {
 
   it('auth logout --dry-run does NOT delete credentials', async () => {
     // First configure a real profile so there's something to (not) delete.
-    await runCli(['auth', 'configure', '--from-env'], {
+    await runCli(['setup', '--from-env', '--no-agent'], {
       TESTSPRITE_API_KEY: 'sk-keep-me',
       TESTSPRITE_API_URL: baseUrl,
     });
     const credPath = join(tmpHome, '.testsprite', 'credentials');
     expect(existsSync(credPath)).toBe(true);
 
-    const result = await runCli(['auth', 'logout', '--dry-run']);
+    const result = await runCli(['auth', 'remove', '--dry-run']);
     expect(result.exitCode).toBe(0);
     expect(existsSync(credPath)).toBe(true);
     expect(result.stderr).toContain('[dry-run]');

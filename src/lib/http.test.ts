@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiError, RequestTimeoutError, TransportError } from './errors.js';
 import type { DebugEvent } from './http.js';
 import { HttpClient, REQUEST_TIMEOUT_DEFAULT_MS, buildUrl, parseRetryAfter } from './http.js';
+import { VERSION } from '../version.js';
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -105,6 +106,17 @@ describe('HttpClient happy path', () => {
     const body = await client.get<{ userId: string }>('/me');
     expect(body.userId).toBe('u1');
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends User-Agent header as testsprite-cli/<version>', async () => {
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      expect(headers.get('user-agent')).toBe(`testsprite-cli/${VERSION}`);
+      expect(headers.get('user-agent')).toMatch(/^testsprite-cli\/\S+$/);
+      return jsonResponse({});
+    });
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await client.get('/me');
   });
 
   it('honors a caller-supplied requestId', async () => {

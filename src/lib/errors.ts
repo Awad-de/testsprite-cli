@@ -203,8 +203,8 @@ export class ApiError extends CLIError {
       code: 'AUTH_REQUIRED',
       message: 'Authentication is required.',
       nextAction:
-        'Run `testsprite auth configure` (interactive — prompts for your API key),' +
-        ' or set TESTSPRITE_API_KEY and run `testsprite auth configure --from-env` for non-interactive flows.',
+        'Run `testsprite setup` (interactive — prompts for your API key and installs the verification skill),' +
+        ' or set TESTSPRITE_API_KEY and run `testsprite setup --from-env` for non-interactive flows.',
       requestId,
       details: {},
     });
@@ -387,7 +387,7 @@ function parseEnvelopeBody(raw: unknown, httpStatus?: number, apiUrl?: string): 
         ? `${message} — endpoint not available on the current backend deployment.`
         : message,
       nextAction: isRouteMissing404
-        ? 'Verify the CLI is targeting the right environment (check `testsprite auth whoami` for `env`), and confirm the backend has the corresponding M3.3 piece deployed.'
+        ? 'Verify the CLI is targeting the right environment (check `testsprite auth status` for `env`), and confirm the backend has the corresponding M3.3 piece deployed.'
         : '',
       requestId: 'unknown',
       details: { statusCode: obj.statusCode },

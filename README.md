@@ -2,9 +2,9 @@
 
 <a href="https://www.testsprite.com">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/testsprite-logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="assets/testsprite-logo-light.svg">
-    <img src="assets/testsprite-logo-dark.svg" alt="TestSprite" width="420">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/testsprite-logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/testsprite-logo-light.png">
+    <img src="assets/testsprite-logo-light.png" alt="TestSprite" width="420">
   </picture>
 </a>
 
@@ -34,9 +34,9 @@ AI ships code in minutes — verifying it hasn't. `testsprite` opens your live a
 
 </div>
 
-https://github.com/user-attachments/assets/eca90a91-93ef-49f6-8d13-86b4eb25f4cf
+<video src="https://github.com/user-attachments/assets/eca90a91-93ef-49f6-8d13-86b4eb25f4cf" controls muted></video>
 
-<p align="center"><sub><b>▶ Watch the launch video</b> — the three hard limits every coding agent hits, and the loop that breaks them (4 min).</sub></p>
+<p align="center"><sub><b><a href="https://github.com/user-attachments/assets/eca90a91-93ef-49f6-8d13-86b4eb25f4cf">▶ Watch the launch video</a></b> — the three hard limits every coding agent hits, and the loop that breaks them (4 min).</sub></p>
 
 ---
 
@@ -58,14 +58,16 @@ Requires **Node.js ≥ 20**. (No global install? `npx @testsprite/testsprite-cli
 
 ```bash
 npm install -g @testsprite/testsprite-cli
-testsprite init
+testsprite setup
 ```
 
-`testsprite init` prompts for your [API key](https://www.testsprite.com), verifies it, and installs the verification-loop skill for your coding agent (`claude`, `cursor`, `cline`, `antigravity`, `codex`, etc.). Non-interactive (CI / onboarding scripts):
+`testsprite setup` prompts for your [API key](https://www.testsprite.com), verifies it, and installs the verification-loop skill for your coding agent (`claude`, `cursor`, `cline`, `antigravity`, `codex`, etc.) — one command, so your agent is wired to verify its own work. Non-interactive (CI / onboarding scripts):
 
 ```bash
-TESTSPRITE_API_KEY=sk-... testsprite init --from-env --yes --agent claude
+TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --yes --agent claude
 ```
+
+> **Pointing a coding agent (Claude Code, Cursor, Codex, Cline, …) at TestSprite?** Have it run `testsprite setup` first — that installs the verification skill, so the agent knows how to create, run, and triage tests on its own (instead of guessing from this README). New here? Start with the **[getting-started overview](https://docs.testsprite.com/cli/getting-started/overview)**.
 
 From there, the loop runs on its own — an example session, typed by the coding agent:
 
@@ -89,10 +91,9 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 
 | Group     | Command                                             | What it does                                                                                                          |
 | --------- | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| **Init**  | `init`                                              | One-shot onboarding: auth configure + whoami + agent install                                                          |
-| **Auth**  | `auth configure`                                    | Store an API key at `~/.testsprite/credentials`                                                                       |
-|           | `auth whoami` _(alias `status`)_                    | Resolve the active profile to its user, key, env, and scopes                                                          |
-|           | `auth logout`                                       | Remove the active profile from the credentials file                                                                   |
+| **Setup** | `setup`                                             | **Start here** — one command: configure your API key, verify it, and install the agent verification skill             |
+| **Auth**  | `auth status`                                       | Resolve the active profile to its user, key, env, and scopes                                                          |
+|           | `auth remove`                                       | Remove the active profile from the credentials file                                                                   |
 | **Read**  | `project list` / `project get`                      | List projects / fetch one by id                                                                                       |
 |           | `test list` / `test get`                            | List tests under a project / fetch one by id                                                                          |
 |           | `test code get`                                     | Print (or write) the generated test source                                                                            |
@@ -109,7 +110,9 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 |           | `test rerun`                                        | Cheap replay of one/many tests (FE verbatim; BE with deps); `--all --project <id>` reruns all tests                   |
 |           | `test wait`                                         | Block on a `runId` until terminal                                                                                     |
 |           | `test artifact get`                                 | Download the failure bundle for a specific `runId`                                                                    |
-| **Agent** | `agent install` / `agent list`                      | Onboard a coding agent (pure-local); targets: `claude`, `codex`, `cursor`, `cline`, `antigravity`                     |
+| **Agent** | `agent install` / `agent list`                      | Add or list coding-agent targets (pure-local): `claude`, `codex`, `cursor`, `cline`, `antigravity`                    |
+
+> The earlier command names — `init`, `auth configure`, `auth whoami`, `auth logout` — still work as hidden, deprecated aliases (each prints a one-line notice pointing at the new name), so existing scripts keep running. `auth configure` now runs the full `setup` (it also installs the skill).
 
 📚 **Full reference — every command, flag, and example:** [DOCUMENTATION.md](./DOCUMENTATION.md), including [configuration & profiles](./DOCUMENTATION.md#configuration), [scripting](./DOCUMENTATION.md#output--scripting), and [exit codes](./DOCUMENTATION.md#exit-codes).
 

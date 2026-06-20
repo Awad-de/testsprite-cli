@@ -4,6 +4,17 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-06-19
+
+### Added
+
+- **`testsprite setup`** — the onboarding command is now named `setup` (formerly `init`): configure your API key, verify it, and install the verification-loop skill for your coding agent in one shot. The old `init` name keeps working as a hidden, deprecated alias.
+
+### Changed
+
+- Onboarding consolidation — `setup` is now the single credential-writing command. The former granular commands are kept as hidden, deprecated aliases: `auth configure` → `setup`, `auth whoami` → `auth status`, `auth logout` → `auth remove`.
+- The CLI now reports its version in the `User-Agent` header on each request.
+
 ## [0.1.1] - 2026-06-12
 
 ### Changed

@@ -113,7 +113,7 @@ testsprite test create --plan-from plan.json --dry-run --output json
 
 ```bash
 npm install -g @testsprite/testsprite-cli
-testsprite init          # configure + verify + install agent skill in one shot
+testsprite setup         # configure + verify + install agent skill in one shot
 ```
 
-Or step-by-step: `testsprite auth configure` → `testsprite auth whoami`.
+Verify your setup anytime: `testsprite auth status`.

@@ -16,6 +16,7 @@ import {
   writeProfile,
 } from '../lib/credentials.js';
 import { loadConfig } from '../lib/config.js';
+import { emitDeprecationNotice } from '../lib/deprecate.js';
 import type { OutputMode } from '../lib/output.js';
 import { GLOBAL_OPTS_HINT, Output } from '../lib/output.js';
 import { promptSecret } from '../lib/prompt.js';
@@ -46,6 +47,16 @@ export interface AuthDeps {
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
   preludeWrite?: (chunk: string) => void;
+  /**
+   * Identifies the higher-level command that invoked `runConfigure`. When set,
+   * it is sent as the `X-CLI-Command` request header on the key-validation
+   * `GET /me` so the backend can attribute the call for product analytics —
+   * e.g. `init` is counted as `cli.initialized` instead of the generic
+   * `cli.session_started`. `auth configure` run directly leaves it unset.
+   * Advisory only: it never changes behavior, and the backend honors only a
+   * known allowlist value.
+   */
+  commandTag?: string;
 }
 
 type CommonOptions = FactoryCommonOptions;
@@ -136,7 +147,14 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
     fetchImpl: deps.fetchImpl,
   });
   try {
-    await pingClient.get<MeResponse>('/me');
+    // Tag the validation call with the originating command (when provided) so
+    // the backend attributes it for product analytics — e.g. `init` → the
+    // cli.initialized event instead of the generic cli.session_started. The
+    // header is advisory; omitting it changes nothing.
+    await pingClient.get<MeResponse>(
+      '/me',
+      deps.commandTag ? { headers: { 'x-cli-command': deps.commandTag } } : {},
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     stderr(`API key rejected by ${apiUrl}: ${message} — profile NOT updated`);
@@ -157,14 +175,10 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
     return `Profile "${d.profile}" configured. Endpoint: ${d.apiUrl}`;
   });
 
-  // Self-bootstrap: nudge the user toward wiring their coding agent to TestSprite.
-  // stderr + text-only + real-run-only so JSON consumers and dry-run previews stay clean.
-  if (opts.output === 'text' && !opts.dryRun) {
-    stderr(
-      'Tip: run `testsprite agent install --target=claude` to let your coding ' +
-        'agent run TestSprite tests automatically (also: cursor, cline, antigravity).',
-    );
-  }
+  // Note: the old "run `testsprite agent install`" self-bootstrap tip was
+  // removed with the setup consolidation. `runConfigure` now only runs as part
+  // of `setup` (the sole credential-writing path), which installs the skill
+  // itself (unless --no-agent) — so the tip would be redundant or misleading.
 }
 
 export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promise<MeResponse> {
@@ -256,36 +270,42 @@ export async function runLogout(opts: CommonOptions, deps: AuthDeps = {}): Promi
 export function createAuthCommand(deps: AuthDeps = {}): Command {
   const auth = new Command('auth').description('Manage TestSprite credentials');
 
-  auth
-    .command('configure')
-    .description('Configure an API key for the active profile')
-    .option(
-      '--from-env',
-      'Read TESTSPRITE_API_KEY (and optionally TESTSPRITE_API_URL) from the environment instead of prompting',
-      false,
-    )
-    .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(async (cmdOpts: { fromEnv?: boolean }, command: Command) => {
-      await runConfigure(
-        { ...resolveCommonOptions(command), fromEnv: Boolean(cmdOpts.fromEnv) },
-        deps,
-      );
-    });
+  // `status` (primary; formerly `whoami`). Credential WRITES no longer live
+  // here — `auth configure` is a hidden, deprecated alias for `setup` (attached
+  // in index.ts), and `setup` is the only command that writes credentials.
 
   auth
-    .command('whoami')
-    .alias('status') // muscle-memory alias; `auth status` resolves to `auth whoami` (dogfood L1802)
-    .description('Show the user, API key, and scopes bound to the active profile')
+    .command('status')
+    .description('Show the user, API key, env, and scopes bound to the active profile')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_cmdOpts, command: Command) => {
       await runWhoami(resolveCommonOptions(command), deps);
     });
 
+  // `whoami` — hidden, deprecated alias for `status` (kept so scripts/agents
+  // on the old name keep working; invisible to --help).
   auth
-    .command('logout')
+    .command('whoami', { hidden: true })
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (_cmdOpts, command: Command) => {
+      emitDeprecationNotice('auth whoami', 'auth status', deps.stderr);
+      await runWhoami(resolveCommonOptions(command), deps);
+    });
+
+  auth
+    .command('remove')
     .description('Remove credentials for the active profile')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_cmdOpts, command: Command) => {
+      await runLogout(resolveCommonOptions(command), deps);
+    });
+
+  // `logout` — hidden, deprecated alias for `remove`.
+  auth
+    .command('logout', { hidden: true })
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (_cmdOpts, command: Command) => {
+      emitDeprecationNotice('auth logout', 'auth remove', deps.stderr);
       await runLogout(resolveCommonOptions(command), deps);
     });
 

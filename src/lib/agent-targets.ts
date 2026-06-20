@@ -92,14 +92,16 @@ type ReadFn = (url: URL) => string;
 const defaultRead: ReadFn = (url: URL) => readFileSync(url, 'utf8');
 
 /**
- * Load the canonical skill body. `../assets/...` resolves to `src/assets/...`
- * under vitest (source) and `dist/assets/...` in the built binary — postbuild
- * copies the tree so both paths exist.
+ * Load the canonical skill body. `../../skills/...` resolves to the repo-root
+ * `skills/` directory in BOTH source (vitest: `src/lib/` → `../../skills`) and
+ * the built/published package (`dist/lib/` → `../../skills` = package root). The
+ * directory ships verbatim via package.json `files`, so no build-time copy step
+ * is needed (unlike the old `src/assets` → `dist/assets` mirror).
  *
  * Injectable `read` fn keeps unit tests off disk.
  */
 export function loadSkillBody(read: ReadFn = defaultRead): string {
-  return read(new URL('../assets/agent-skill/testsprite-verify.skill.md', import.meta.url));
+  return read(new URL('../../skills/testsprite-verify.skill.md', import.meta.url));
 }
 
 /**
@@ -107,7 +109,7 @@ export function loadSkillBody(read: ReadFn = defaultRead): string {
  * Designed for AGENTS.md managed-section injection.
  */
 export function loadCodexSkillBody(read: ReadFn = defaultRead): string {
-  return read(new URL('../assets/agent-skill/testsprite-verify.codex.md', import.meta.url));
+  return read(new URL('../../skills/testsprite-verify.codex.md', import.meta.url));
 }
 
 /**

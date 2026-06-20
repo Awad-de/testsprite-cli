@@ -12,6 +12,7 @@
 
 import { Command } from 'commander';
 import type { CommonOptions as FactoryCommonOptions } from '../lib/client-factory.js';
+import { emitDeprecationNotice } from '../lib/deprecate.js';
 import { CLIError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT, Output } from '../lib/output.js';
 import type { AuthDeps, MeResponse } from './auth.js';
@@ -109,7 +110,7 @@ export interface InitSummary {
  * and runWhoami's identity block are replaced by the init summary.
  * stderr (advisory messages, errors) flows through.
  */
-function toAuthDeps(deps: InitDeps, apiKey?: string): AuthDeps {
+function toAuthDeps(deps: InitDeps, apiKey?: string, commandTag?: string): AuthDeps {
   return {
     env: deps.env,
     credentialsPath: deps.credentialsPath,
@@ -123,6 +124,10 @@ function toAuthDeps(deps: InitDeps, apiKey?: string): AuthDeps {
     // If an explicit API key was provided, override the prompt so configure
     // never actually prompts the user.
     prompt: apiKey ? { secret: async (_q: string) => apiKey } : deps.prompt,
+    // Telemetry attribution for the configure-validate GET /me. Passed only for
+    // the configure step (see runInit) — never whoami — so each init run emits
+    // exactly one cli.initialized event on the backend.
+    commandTag,
   };
 }
 
@@ -238,7 +243,10 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   // as the prompt) instead of reading TESTSPRITE_API_KEY from the environment (codex).
   await runConfigure(
     { ...opts, fromEnv: opts.apiKey ? false : opts.fromEnv },
-    toAuthDeps(deps, opts.apiKey),
+    // commandTag:'init' tags ONLY this configure-validate GET /me with
+    // `X-CLI-Command: init` → counted as cli.initialized. The whoami banner call
+    // below builds deps WITHOUT a tag, so init emits exactly one cli.initialized.
+    toAuthDeps(deps, opts.apiKey, 'init'),
   );
 
   // -------------------------------------------------------------------------
@@ -399,12 +407,32 @@ function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
   return Math.round(n * 1000);
 }
 
-export function createInitCommand(deps: InitDeps = {}): Command {
-  const validTargets = Object.keys(TARGETS) as AgentTarget[];
-  const defaultAgent: AgentTarget = 'claude';
+const SETUP_DESCRIPTION =
+  'Set up TestSprite: configure your API key and install the verification skill for your coding agent';
 
-  const cmd = new Command('init')
-    .description('One-shot onboarding: configure an API key and install the coding-agent skill')
+/** Raw Commander options shared by `setup` and the deprecated `init` alias. */
+interface SetupCmdOpts {
+  apiKey?: string;
+  fromEnv?: boolean;
+  /**
+   * Commander sets `agent: false` (boolean) when `--no-agent` is given,
+   * because `--no-agent` negates the `--agent <target>` option. Handle both
+   * string and false shapes.
+   */
+  agent: string | false;
+  noAgent?: boolean;
+  force?: boolean;
+  dir?: string;
+  yes?: boolean;
+}
+
+/** Attach the onboarding flags shared by `setup` and the `init` alias. */
+function addSetupOptions(
+  cmd: Command,
+  validTargets: AgentTarget[],
+  defaultAgent: AgentTarget,
+): Command {
+  return cmd
     .option('--api-key <key>', 'API key to configure (skips the interactive prompt)')
     .option(
       '--from-env',
@@ -419,75 +447,111 @@ export function createInitCommand(deps: InitDeps = {}): Command {
     .option('--no-agent', 'Skip the agent skill install (configure credentials only)')
     .option('--force', 'Overwrite an existing skill file (a .bak backup is kept)')
     .option('--dir <path>', 'Project root for the skill install (default: current directory)')
-    .option('-y, --yes', 'Non-interactive: accept all defaults, never prompt')
+    .option('-y, --yes', 'Non-interactive: accept all defaults, never prompt');
+}
+
+/** Build {@link InitOptions} from raw Commander opts + globals. */
+function buildSetupOptions(
+  cmdOpts: SetupCmdOpts,
+  command: Command,
+  defaultAgent: AgentTarget,
+): InitOptions {
+  const common = resolveCommonOptions(command);
+
+  // Commander sets `agent: false` (boolean) when `--no-agent` is passed,
+  // because `--no-agent` is the negation of `--agent <target>`. Guard against
+  // this: if agent is falsy (false or empty string) default to the CLI default
+  // so runInstall never receives a non-string target.
+  const resolvedAgent =
+    cmdOpts.agent && typeof cmdOpts.agent === 'string' ? cmdOpts.agent : defaultAgent;
+  const isNoAgent = cmdOpts.noAgent === true || cmdOpts.agent === false;
+
+  // Detect conflict when both --no-agent and --agent <target> appear in the raw
+  // args. Commander only populates `rawArgs` on the ROOT command passed to
+  // parseAsync; subcommands have an empty array. Walk up to the root so we
+  // always inspect the full argv.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let root: any = command;
+  while (root.parent) root = root.parent;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rawArgs: string[] = (root as any).rawArgs ?? process.argv;
+  const rawArgConflict =
+    rawArgs.some((a: string) => a === '--no-agent') &&
+    rawArgs.some((a: string) => a === '--agent' || a.startsWith('--agent='));
+
+  return {
+    ...common,
+    apiKey: cmdOpts.apiKey,
+    fromEnv: Boolean(cmdOpts.fromEnv),
+    agent: resolvedAgent,
+    noAgent: isNoAgent,
+    force: Boolean(cmdOpts.force),
+    dir: cmdOpts.dir,
+    yes: Boolean(cmdOpts.yes),
+    rawArgConflict,
+  };
+}
+
+/** Shared action for `setup` and the deprecated `init` alias. */
+async function runSetupAction(
+  cmdOpts: SetupCmdOpts,
+  command: Command,
+  deps: InitDeps,
+  defaultAgent: AgentTarget,
+): Promise<void> {
+  const opts = buildSetupOptions(cmdOpts, command, defaultAgent);
+
+  // When --yes is supplied without a key source, force isTTY=false so runInit
+  // emits exit 5 with a clear message rather than hanging on a prompt in a
+  // headless CI environment where a TTY fd happens to be open.
+  const effectiveDeps: InitDeps = {
+    ...deps,
+    ...(opts.yes && !opts.apiKey && !opts.fromEnv ? { isTTY: false } : {}),
+  };
+
+  await runInit(opts, effectiveDeps);
+}
+
+export function createSetupCommand(deps: InitDeps = {}): Command {
+  const validTargets = Object.keys(TARGETS) as AgentTarget[];
+  const defaultAgent: AgentTarget = 'claude';
+
+  return addSetupOptions(new Command('setup'), validTargets, defaultAgent)
+    .description(SETUP_DESCRIPTION)
     .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(
-      async (
-        cmdOpts: {
-          apiKey?: string;
-          fromEnv?: boolean;
-          /**
-           * Commander sets `agent: false` (boolean) when `--no-agent` is given,
-           * because `--no-agent` negates the `--agent <target>` option.
-           * Handle both string and false shapes.
-           */
-          agent: string | false;
-          noAgent?: boolean;
-          force?: boolean;
-          dir?: string;
-          yes?: boolean;
-        },
-        command: Command,
-      ) => {
-        const common = resolveCommonOptions(command);
+    .action(async (cmdOpts: SetupCmdOpts, command: Command) => {
+      await runSetupAction(cmdOpts, command, deps, defaultAgent);
+    });
+}
 
-        // Commander sets `agent: false` (boolean) when `--no-agent` is passed,
-        // because `--no-agent` is the negation of `--agent <target>`. Guard
-        // against this: if agent is falsy (false or empty string) default to
-        // the CLI default so runInstall never receives a non-string target.
-        const resolvedAgent =
-          cmdOpts.agent && typeof cmdOpts.agent === 'string' ? cmdOpts.agent : defaultAgent;
-        const isNoAgent = cmdOpts.noAgent === true || cmdOpts.agent === false;
+/**
+ * Hidden, deprecated `init` alias → runs `setup`. Kept so existing scripts and
+ * agents trained on the old command keep working; registered with
+ * `{ hidden: true }` in index.ts (invisible to `--help`) and prints a
+ * deprecation notice. (Setup consolidation.)
+ */
+export function createDeprecatedInitCommand(deps: InitDeps = {}): Command {
+  const validTargets = Object.keys(TARGETS) as AgentTarget[];
+  const defaultAgent: AgentTarget = 'claude';
 
-        // Fix 5: detect conflict when both --no-agent and --agent <target> appear
-        // in the raw args. Thread the flag into runInit so it can emit the [warn]
-        // via deps.stderr (testable) instead of process.stderr directly.
-        //
-        // Commander only populates `rawArgs` on the ROOT command passed to
-        // parseAsync; subcommands have an empty array. Walk up to the root
-        // so we always inspect the full argv.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        let root: any = command;
-        while (root.parent) root = root.parent;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const rawArgs: string[] = (root as any).rawArgs ?? process.argv;
-        const rawArgConflict =
-          rawArgs.some((a: string) => a === '--no-agent') &&
-          rawArgs.some((a: string) => a === '--agent' || a.startsWith('--agent='));
+  return addSetupOptions(new Command('init'), validTargets, defaultAgent)
+    .description('(deprecated) alias for `setup`')
+    .action(async (cmdOpts: SetupCmdOpts, command: Command) => {
+      emitDeprecationNotice('init', 'setup', deps.stderr);
+      await runSetupAction(cmdOpts, command, deps, defaultAgent);
+    });
+}
 
-        const opts: InitOptions = {
-          ...common,
-          apiKey: cmdOpts.apiKey,
-          fromEnv: Boolean(cmdOpts.fromEnv),
-          agent: resolvedAgent,
-          noAgent: isNoAgent,
-          force: Boolean(cmdOpts.force),
-          dir: cmdOpts.dir,
-          yes: Boolean(cmdOpts.yes),
-          rawArgConflict,
-        };
-
-        // When --yes is supplied without a key source, force isTTY=false so
-        // runInit emits exit 5 with a clear message rather than hanging on a
-        // prompt in a headless CI environment where a TTY fd happens to be open.
-        const effectiveDeps: InitDeps = {
-          ...deps,
-          ...(opts.yes && !opts.apiKey && !opts.fromEnv ? { isTTY: false } : {}),
-        };
-
-        await runInit(opts, effectiveDeps);
-      },
-    );
-
-  return cmd;
+/**
+ * Entry for the hidden, deprecated `auth configure` alias. Per the setup
+ * consolidation, `auth configure` now runs FULL setup (configure + install)
+ * so an agent that reaches for the old command still ends up with the skill.
+ * `setup` is the ONLY path that writes credentials.
+ */
+export async function runConfigureViaSetup(
+  command: Command,
+  deps: InitDeps,
+  fromEnv: boolean,
+): Promise<void> {
+  await runSetupAction({ agent: 'claude', fromEnv }, command, deps, 'claude');
 }
