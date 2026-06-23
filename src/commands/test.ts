@@ -2753,43 +2753,30 @@ async function runBatchRun(
     };
   }
 
-  // Bounded concurrency fan-out using a semaphore pattern.
-  // We process testIds one slot at a time up to the concurrency limit.
-  // This avoids pulling in p-limit; the logic is simple enough inline.
-  const remaining = [...testIds];
-  const inFlight = new Set<Promise<CliBatchRunResult>>();
+  // Bounded concurrency fan-out: launch up to concurrencyLimit jobs, then
+  // launch the next one as each finishes. Mirrors the startNext() pattern
+  // used by the other fan-outs in this file (e.g. pollFreshAccepted below).
+  let nextIdx = 0;
+  let inFlight = 0;
 
-  async function drainOne(): Promise<void> {
-    const testId = remaining.shift();
-    if (testId === undefined) return;
-    const p = triggerOne(testId).then(result => {
-      batchRunResults.push(result);
-      inFlight.delete(p);
-      return result;
-    });
-    inFlight.add(p);
-    await p;
-  }
-
-  // Fill up to concurrencyLimit slots, then drain one before adding
-  // each new testId so we never exceed the limit.
-  const initial = Math.min(concurrencyLimit, testIds.length);
-  const startPromises: Promise<void>[] = [];
-  for (let i = 0; i < initial; i++) {
-    startPromises.push(drainOne());
-  }
-  // Process remaining items as slots free up.
-  while (remaining.length > 0) {
-    // Wait for any in-flight slot to free up.
-    if (inFlight.size > 0) {
-      await Promise.race(inFlight);
+  await new Promise<void>((resolve, reject) => {
+    function startNext(): void {
+      while (inFlight < concurrencyLimit && nextIdx < testIds.length) {
+        const testId = testIds[nextIdx++]!;
+        inFlight++;
+        triggerOne(testId)
+          .then(result => {
+            batchRunResults.push(result);
+            inFlight--;
+            startNext();
+            if (inFlight === 0 && nextIdx >= testIds.length) resolve();
+          })
+          .catch(reject);
+      }
     }
-    if (remaining.length > 0 && inFlight.size < concurrencyLimit) {
-      await drainOne();
-    }
-  }
-  // Wait for all in-flight to finish.
-  await Promise.all([...inFlight, ...startPromises]);
+    startNext();
+    if (testIds.length === 0) resolve();
+  });
 
   // Sort by testId order (same as input order for stable output).
   batchRunResults.sort((a, b) => testIds.indexOf(a.testId) - testIds.indexOf(b.testId));
