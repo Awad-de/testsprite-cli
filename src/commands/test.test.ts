@@ -6694,6 +6694,103 @@ describe('runCreateBatch', () => {
     ).resolves.toBeDefined();
   });
 
+  // Regression test: create-batch --run must keep launching new triggers
+  // up to --max-concurrency as slots free up, not collapse to serial
+  // after the first wave. Uses equal-delay trigger responses so the
+  // first three jobs settle in the same microtask batch, the exact
+  // condition that exposed the bug (race only reacts to one settlement,
+  // then blocks the scheduler on the whole next job before moving on).
+  it('--run keeps concurrency at --max-concurrency for tail jobs, not just the first wave', async () => {
+    const { credentialsPath } = makeCreds();
+    const specs = Array.from({ length: 6 }, (_, i) => ({ ...FE_SPEC, name: `spec-${i}` }));
+    const plansFile = writePlansJsonl(specs);
+    const CREATE_RESP = {
+      results: specs.map((_, i) => ({
+        specIndex: i,
+        testId: `test_tail_${i}`,
+        status: 'created' as const,
+      })),
+      summary: { total: 6, created: 6, failed: 0 },
+    };
+    const TRIGGER_DELAY_MS = 60;
+    const limit = 3;
+    let activeCount = 0;
+    let triggerCallIndex = 0;
+    const activeAtStart: number[] = [];
+
+    type FetchInput2 = Parameters<typeof globalThis.fetch>[0];
+    const fetchImpl = (async (input: FetchInput2) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      if (url.includes('/tests/batch')) {
+        return new Response(JSON.stringify(CREATE_RESP), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.includes('/runs')) {
+        const callIdx = triggerCallIndex++;
+        activeCount++;
+        activeAtStart[callIdx] = activeCount;
+        await new Promise(resolve => setTimeout(resolve, TRIGGER_DELAY_MS));
+        activeCount--;
+        return new Response(
+          JSON.stringify({
+            runId: `run_tail_${callIdx}`,
+            status: 'queued' as const,
+            enqueuedAt: '2026-06-09T10:00:00.000Z',
+            codeVersion: 'v1',
+            targetUrl: 'https://example.com',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          error: { code: 'NOT_FOUND', message: 'not found', nextAction: '', requestId: 'r1' },
+        }),
+        { status: 404, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof globalThis.fetch;
+
+    try {
+      await runCreateBatch(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          plans: plansFile,
+          run: true,
+          wait: false,
+          dryRun: false,
+          maxConcurrency: limit,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as ReturnType<typeof makeFetch>,
+          stdout: () => undefined,
+          stderr: () => undefined,
+        },
+      );
+    } catch {
+      // CLIError exit 1 expected: trigger status is 'queued', not 'passed'.
+    }
+
+    expect(activeAtStart).toHaveLength(6);
+    // First wave fills up to the limit; true under the bug too.
+    expect(Math.max(...activeAtStart.slice(0, limit))).toBe(limit);
+    // Tail jobs (index >= limit) must ALSO reach the concurrency limit.
+    // Under the bug, the scheduler blocks on each whole job after the
+    // first wave, so every tail job launches alone (active === 1).
+    for (const snapshot of activeAtStart.slice(limit)) {
+      expect(snapshot).toBe(limit);
+    }
+  });
+
   // Per codex round-1 P2: a 200 OK with `summary.created === 0` on a
   // non-empty batch must not exit 0. Without this, a misconfigured
   // batch job (every spec invalid) silently lands nothing in DDB while
