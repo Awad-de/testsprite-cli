@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import type { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, RequestTimeoutError } from '../lib/errors.js';
+import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { RunResponse, TriggerRunResponse, BatchRunFreshResponse } from '../lib/runs.types.js';
 import { runTestRun, runTestRunAll } from './test.js';
@@ -2665,8 +2666,10 @@ describe('runTestRunAll — batch fresh run', () => {
   });
 
   it('--dry-run returns sample without network call', async () => {
+    resetDryRunBannerForTesting();
     const fetchImpl = vi.fn() as unknown as FetchImpl;
     const out: string[] = [];
+    const err: string[] = [];
     await runTestRunAll(
       {
         profile: 'default',
@@ -2678,11 +2681,18 @@ describe('runTestRunAll — batch fresh run', () => {
         timeoutSeconds: 600,
         maxConcurrency: 10,
       },
-      { fetchImpl, stdout: line => out.push(line), stderr: () => undefined, sleep: instantSleep },
+      {
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => err.push(line),
+        sleep: instantSleep,
+      },
     );
     expect(fetchImpl).not.toHaveBeenCalled();
     // Should print a non-empty JSON body (sample or envelope)
     expect(out.length).toBeGreaterThan(0);
+    // DEV-247: the canned sample must carry the "not from the server" banner.
+    expect(err).toContain(DRY_RUN_BANNER);
   });
 
   it('--wait with timeout → exit 7', async () => {

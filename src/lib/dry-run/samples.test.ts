@@ -107,11 +107,15 @@ describe('findSample', () => {
           });
           break;
         case 'getTestResult':
+          // verdict (outcome) + executionStatus (lifecycle) + semantic
+          // summary string, alongside the retained legacy `status`.
           expect(body).toMatchObject({
             testId: expect.any(String),
             status: expect.any(String),
+            verdict: expect.any(String),
+            executionStatus: expect.any(String),
             snapshotId: expect.any(String),
-            summary: expect.any(Object),
+            summary: expect.any(String),
             targetUrlSource: 'run',
           });
           break;

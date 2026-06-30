@@ -996,7 +996,9 @@ const RESULT_FAILED: CliLatestResult = {
   targetUrl: 'https://staging.example.com/checkout',
   failedStepIndex: 5,
   failureKind: 'assertion',
-  summary: { passed: 4, failed: 1, skipped: 0 },
+  verdict: 'failed',
+  executionStatus: 'completed',
+  summary: 'Failed (assertion) on step 5: expected order confirmation heading to be visible.',
 };
 
 const RESULT_PASSED: CliLatestResult = {
@@ -1012,7 +1014,9 @@ const RESULT_PASSED: CliLatestResult = {
   targetUrl: 'https://staging.example.com/checkout',
   failedStepIndex: null,
   failureKind: null,
-  summary: { passed: 8, failed: 0, skipped: 0 },
+  verdict: 'passed',
+  executionStatus: 'completed',
+  summary: 'Test passed.',
 };
 
 describe('isPresignedCodeUrl', () => {
@@ -1608,7 +1612,7 @@ describe('runCodeGet', () => {
 describe('runCodePut', () => {
   function writeCodeFile(contents: string): string {
     const dir = mkdtempSync(join(tmpdir(), 'cli-p4-'));
-    const path = join(dir, 'updated.spec.ts');
+    const path = join(dir, 'updated.py');
     writeFileSync(path, contents, 'utf8');
     return path;
   }
@@ -1754,6 +1758,65 @@ describe('runCodePut', () => {
     ).rejects.toMatchObject({
       code: 'VALIDATION_ERROR',
       details: expect.objectContaining({ field: 'language' }),
+    });
+    expect(called).toBe(0);
+  });
+
+  it('rejects --language typescript / javascript (only python is supported) (DEV-232 / #210)', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('print("hi")');
+    for (const lang of ['typescript', 'javascript'] as const) {
+      let called = 0;
+      const fetchImpl = makeFetch(() => {
+        called += 1;
+        return { body: SAMPLE_RESPONSE };
+      });
+      await expect(
+        runCodePut(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            testId: 'test_alpha',
+            codeFile,
+            expectedVersion: 'v3',
+            language: lang as never,
+          },
+          { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        details: expect.objectContaining({ field: 'language' }),
+      });
+      expect(called).toBe(0);
+    }
+  });
+
+  it('rejects a non-Python (.ts) --code-file before sending (DEV-232)', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-codeput-ts-'));
+    const tsFile = join(dir, 'updated.spec.ts');
+    writeFileSync(tsFile, 'export const x = 1;\n', 'utf8');
+    let called = 0;
+    const fetchImpl = makeFetch(() => {
+      called += 1;
+      return { body: SAMPLE_RESPONSE };
+    });
+    await expect(
+      runCodePut(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_alpha',
+          codeFile: tsFile,
+          expectedVersion: 'v3',
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'code-file' }),
     });
     expect(called).toBe(0);
   });
@@ -2630,7 +2693,11 @@ describe('runResult', () => {
     expect(indexLine).toBeLessThan(startedLine);
     expect(block).toContain('failureKind:        assertion');
     expect(block).toContain('failedStepIndex:    5');
-    expect(block).toContain('summary:            passed=4 failed=1 skipped=0');
+    // verdict + executionStatus replace the conflated status line;
+    // summary is a semantic sentence.
+    expect(block).toContain('verdict:            failed');
+    expect(block).toContain('executionStatus:    completed');
+    expect(block).toContain('summary:            Failed (assertion) on step 5');
     expect(block).toContain('failureAnalysisUrl: ');
   });
 
@@ -2643,11 +2710,13 @@ describe('runResult', () => {
       { credentialsPath, fetchImpl, stdout: line => out.push(line) },
     );
     const block = out.join('\n');
-    expect(block).toContain('status:             passed');
+    // verdict/executionStatus instead of the conflated status line.
+    expect(block).toContain('verdict:            passed');
+    expect(block).toContain('executionStatus:    completed');
     expect(block).not.toContain('failureKind');
     expect(block).not.toContain('failedStepIndex');
     expect(block).not.toContain('failureAnalysisUrl');
-    expect(block).toContain('summary:            passed=8 failed=0 skipped=0');
+    expect(block).toContain('summary:            Test passed.');
   });
 
   it('CONFLICT envelope from /result maps to exit 6 (snapshot in flight)', async () => {
@@ -3226,7 +3295,9 @@ function makeFailureContext(overrides: Partial<CliFailureContext> = {}): CliFail
     targetUrl: 'https://staging.example.com/checkout',
     failedStepIndex: 5,
     failureKind: 'assertion',
-    summary: { passed: 4, failed: 1, skipped: 0 },
+    verdict: 'failed',
+    executionStatus: 'completed',
+    summary: 'Failed (assertion) on step 5: assertion error.',
     ...overrides.result,
   };
   return {
@@ -3858,7 +3929,7 @@ describe('runFailureGet', () => {
 describe('runCreate', () => {
   function writeCodeFile(contents: string): string {
     const dir = mkdtempSync(join(tmpdir(), 'cli-p2-'));
-    const path = join(dir, 'test.spec.ts');
+    const path = join(dir, 'test.py');
     writeFileSync(path, contents, 'utf8');
     return path;
   }
@@ -3983,7 +4054,7 @@ describe('runCreate', () => {
           projectId: 'project_alice',
           type: 'frontend',
           name: 'n',
-          codeFile: '/tmp/this-file-does-not-exist-xyz123.spec.ts',
+          codeFile: '/tmp/this-file-does-not-exist-xyz123.py',
         },
         { credentialsPath, fetchImpl: fetchImpl as never, stdout: () => undefined },
       ),
@@ -3993,6 +4064,81 @@ describe('runCreate', () => {
       details: expect.objectContaining({ field: 'code-file' }),
     });
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-Python (.ts) --code-file with VALIDATION_ERROR before any fetch (DEV-232)', async () => {
+    const { credentialsPath } = makeCreds();
+    // The file exists, so this isolates the extension gate (not ENOENT).
+    const dir = mkdtempSync(join(tmpdir(), 'cli-p2-ts-'));
+    const tsFile = join(dir, 'test.spec.ts');
+    writeFileSync(tsFile, 'test("smoke", async () => {});\n', 'utf8');
+    const fetchImpl = vi.fn();
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_alice',
+          type: 'backend',
+          name: 'n',
+          codeFile: tsFile,
+        },
+        { credentialsPath, fetchImpl: fetchImpl as never, stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'code-file' }),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('accepts a Python (.py) --code-file (DEV-232)', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('import requests\n\n\ndef test_ok():\n    assert True\n');
+    const fetchImpl = makeFetch((_url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      return { status: 200, body: SAMPLE_RESPONSE };
+    });
+    const res = await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'backend',
+        name: 'n',
+        codeFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(res).toEqual(SAMPLE_RESPONSE);
+  });
+
+  it('rejects a non-Python --code-file even under --dry-run (gate runs before the dry-run branch) (DEV-232)', async () => {
+    // dry-run skips fs, but the extension gate is an up-front input check, so a
+    // .ts file is rejected even in dry-run — the preview matches a real run.
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: true,
+          projectId: 'project_alice',
+          type: 'backend',
+          name: 'n',
+          codeFile: '/tmp/whatever-dry-run.spec.ts',
+        },
+        { stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'code-file' }),
+    });
   });
 
   it('missing --project surfaces VALIDATION_ERROR (input gate before fs)', async () => {
@@ -4127,7 +4273,7 @@ describe('runCreate', () => {
         projectId: 'project_alice',
         type: 'frontend',
         name: 'n',
-        codeFile: '/tmp/this-file-does-not-exist-dry-run-xyz.spec.ts',
+        codeFile: '/tmp/this-file-does-not-exist-dry-run-xyz.py',
       },
       { stdout: () => undefined, stderr: () => undefined },
     );
@@ -4570,7 +4716,7 @@ describe('runCreate', () => {
 describe('[B-E2E-03] runCreate: whitespace-only --name → VALIDATION_ERROR exit 5', () => {
   function writeCodeFile(contents: string): string {
     const dir = mkdtempSync(join(tmpdir(), 'cli-fix3-name-'));
-    const path = join(dir, 'test.spec.ts');
+    const path = join(dir, 'test.py');
     writeFileSync(path, contents, 'utf8');
     return path;
   }
@@ -4677,7 +4823,7 @@ describe('[B-E2E-03] runCreate: whitespace-only --name → VALIDATION_ERROR exit
 describe('runCreate — M4 BE dependency authoring flags', () => {
   function writeCodeFile(contents: string): string {
     const dir = mkdtempSync(join(tmpdir(), 'cli-m4-dep-'));
-    const path = join(dir, 'test.spec.ts');
+    const path = join(dir, 'test.py');
     writeFileSync(path, contents, 'utf8');
     return path;
   }
@@ -6026,7 +6172,7 @@ describe('runCreateFromPlan', () => {
           projectId: 'project_alice',
           type: 'frontend',
           name: 'n',
-          codeFile: '/tmp/this-file-does-not-exist-p2b-boundary.spec.ts',
+          codeFile: '/tmp/this-file-does-not-exist-p2b-boundary.py',
           idempotencyKey: boundaryKey,
           run: true,
         },
@@ -7185,7 +7331,7 @@ describe('[finding-1] first-run --timeout hint flows through test create --run -
   it('emits [hint] when --timeout was not set (timeoutIsDefault=true) for test create --run --wait', async () => {
     const { credentialsPath } = makeCreds();
     const codeDir = mkdtempSync(join(tmpdir(), 'cli-f1-code-'));
-    const codeFile = join(codeDir, 'test.spec.ts');
+    const codeFile = join(codeDir, 'test.py');
     writeFileSync(codeFile, '// chain test code', 'utf8');
     const stderrLines: string[] = [];
 
@@ -7220,7 +7366,7 @@ describe('[finding-1] first-run --timeout hint flows through test create --run -
   it('does NOT emit [hint] when --timeout was explicitly set (timeoutIsDefault=false) for test create --run --wait', async () => {
     const { credentialsPath } = makeCreds();
     const codeDir2 = mkdtempSync(join(tmpdir(), 'cli-f1-code2-'));
-    const codeFile = join(codeDir2, 'test2.spec.ts');
+    const codeFile = join(codeDir2, 'test2.py');
     writeFileSync(codeFile, '// chain test code 2', 'utf8');
     const stderrLines: string[] = [];
 
@@ -7338,7 +7484,7 @@ describe('[finding-1] first-run --timeout hint flows through test create --run -
 describe('Fix 5 — dashboardUrl emission', () => {
   function writeCodeFile(contents: string): string {
     const dir = mkdtempSync(join(tmpdir(), 'cli-dash-'));
-    const path = join(dir, 'test.spec.ts');
+    const path = join(dir, 'test.py');
     writeFileSync(path, contents, 'utf8');
     return path;
   }

@@ -38,9 +38,10 @@ import type { Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import { createWriteStream } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { CliFailureContext, CliTestStep } from '../commands/test.js';
-import { ApiError, TransportError } from './errors.js';
+import { ApiError, TransportError, localValidationError } from './errors.js';
+import { requireEnum } from './validate.js';
 import type { FetchImpl } from './http.js';
 
 /** Schema version stamped into `meta.json`. Bumps with the contract. */
@@ -337,9 +338,12 @@ export function pickCodeExtension(language: string, framework: string): string {
   if (language === 'python') return 'py';
   if (language === 'javascript') return 'js';
   if (language === 'typescript') return 'ts';
-  // Fallback: framework-keyed default. pytest is python, playwright TS.
+  // Fallback when the server didn't stamp a language: both TestSprite
+  // frameworks are Python — backend `pytest` and frontend Playwright
+  // (`playwright.async_api`) — so default to `.py`. (Legacy TS/JS rows
+  // carry an explicit `language` above and are honored as `.ts`/`.js`.)
   if (framework === 'pytest') return 'py';
-  return 'ts';
+  return 'py';
 }
 
 /**
@@ -351,6 +355,25 @@ export function pickCodeExtension(language: string, framework: string): string {
  */
 export function stepFilenamePrefix(stepIndex: number): string {
   return stepIndex >= 100 ? String(stepIndex).padStart(3, '0') : String(stepIndex).padStart(2, '0');
+}
+
+/**
+ * Refuse a composed artifact path that escapes `baseDir`. Step filenames are
+ * built from response-controlled fields, so this is the final containment
+ * check before any write. Returns the validated absolute path.
+ */
+export function assertNoEscape(baseDir: string, segment: string): string {
+  const composed = resolve(baseDir, segment);
+  const rel = relative(baseDir, composed);
+  if (rel.startsWith('..') || isAbsolute(rel)) {
+    throw localValidationError(
+      'out',
+      'resolved artifact path escapes the bundle directory',
+      undefined,
+      'field',
+    );
+  }
+  return composed;
 }
 
 /**
@@ -601,17 +624,22 @@ async function writeStepArtifacts(
   fetchImpl: FetchImpl,
   filesWritten: string[],
 ): Promise<void> {
+  // stepIndex comes straight from the response and is used to build the
+  // filename — reject anything that isn't a real index before composing a path.
+  if (!Number.isInteger(step.stepIndex) || step.stepIndex < 0) {
+    throw localValidationError('stepIndex', 'must be a non-negative integer', undefined, 'field');
+  }
   const prefix = stepFilenamePrefix(step.stepIndex);
 
   if (step.screenshotUrl) {
     const file = `${prefix}-screenshot.png`;
-    await streamUrlToFile(step.screenshotUrl, join(stepsTmpDir, file), fetchImpl);
+    await streamUrlToFile(step.screenshotUrl, assertNoEscape(stepsTmpDir, file), fetchImpl);
     filesWritten.push(`steps/${file}`);
   }
 
   if (step.htmlSnapshotUrl) {
     const file = `${prefix}-snapshot.html`;
-    await streamUrlToFile(step.htmlSnapshotUrl, join(stepsTmpDir, file), fetchImpl);
+    await streamUrlToFile(step.htmlSnapshotUrl, assertNoEscape(stepsTmpDir, file), fetchImpl);
     filesWritten.push(`steps/${file}`);
   }
 
@@ -636,6 +664,8 @@ async function writeStepArtifacts(
   if (sidecar.length > 0) {
     const dereferenced = await Promise.all(
       sidecar.map(async (entry, i) => {
+        // kind comes from the response and is used in the filename — validate it.
+        requireEnum('kind', entry.kind, ['screenshot', 'snapshot', 'log', 'network', 'console']);
         // Reuse the already-downloaded step file when the evidence URL
         // matches the step's primary screenshot/snapshot URL. Cheap
         // dedupe — no extra HTTP round-trip, no duplicate bytes on disk.
@@ -661,7 +691,7 @@ async function writeStepArtifacts(
         }
         const ext = sidecarExtension(entry.kind);
         const filename = `${prefix}-${entry.kind}-${i}.${ext}`;
-        await streamUrlToFile(entry.url, join(stepsTmpDir, filename), fetchImpl);
+        await streamUrlToFile(entry.url, assertNoEscape(stepsTmpDir, filename), fetchImpl);
         filesWritten.push(`steps/${filename}`);
         return {
           kind: entry.kind,
@@ -675,7 +705,11 @@ async function writeStepArtifacts(
       }),
     );
     const file = `${prefix}-evidence.json`;
-    await writeFile(join(stepsTmpDir, file), JSON.stringify(dereferenced, null, 2) + '\n', 'utf8');
+    await writeFile(
+      assertNoEscape(stepsTmpDir, file),
+      JSON.stringify(dereferenced, null, 2) + '\n',
+      'utf8',
+    );
     filesWritten.push(`steps/${file}`);
   }
 }

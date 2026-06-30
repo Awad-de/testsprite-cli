@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { Command } from 'commander';
 import {
+  emitDryRunBanner,
   makeHttpClient,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
@@ -159,6 +160,9 @@ export async function runCreate(
   }
 
   if (opts.dryRun) {
+    // DEV-247: this path returns before makeClient() fires the banner, so emit it
+    // here — otherwise the canned sample can be mistaken for a live response.
+    emitDryRunBanner(stderr);
     const idempotencyKey = opts.idempotencyKey ?? `cli-proj-create-${randomUUID()}`;
     // P2-6: gate idempotency-key output behind --verbose/--debug/json (matches
     // test create convention). Suppress in plain text interactive mode to reduce
@@ -281,6 +285,8 @@ export async function runUpdate(
   }
 
   if (opts.dryRun) {
+    // DEV-247: emit the banner here (this path returns before makeClient() does).
+    emitDryRunBanner(stderr);
     const idempotencyKey = opts.idempotencyKey ?? `cli-proj-update-${randomUUID()}`;
     if (
       opts.idempotencyKey === undefined &&

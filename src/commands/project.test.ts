@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../lib/errors.js';
+import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import {
   type CliProject,
   type CliUpdateProjectResponse,
@@ -485,11 +486,13 @@ describe('runCreate', () => {
   });
 
   it('P6 — dry-run returns canned shape without hitting the network', async () => {
+    resetDryRunBannerForTesting();
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn(async () => {
       throw new Error('should not hit network in dry-run');
     });
     const out: string[] = [];
+    const err: string[] = [];
     const result = await runCreate(
       {
         profile: 'default',
@@ -504,13 +507,15 @@ describe('runCreate', () => {
         credentialsPath,
         fetchImpl: fetchImpl as unknown as typeof fetch,
         stdout: line => out.push(line),
-        stderr: () => {},
+        stderr: line => err.push(line),
       },
     );
 
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(result.type).toBe('frontend');
     expect(result.name).toBe('DryRun Project');
+    // DEV-247: the canned sample must carry the "not from the server" banner.
+    expect(err).toContain(DRY_RUN_BANNER);
   });
 
   it('P6 — renders text mode with §6.1 field labels', async () => {
@@ -642,10 +647,12 @@ describe('runUpdate', () => {
   });
 
   it('P7 — dry-run returns canned shape without network call', async () => {
+    resetDryRunBannerForTesting();
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn(async () => {
       throw new Error('should not hit network');
     });
+    const err: string[] = [];
     const result = await runUpdate(
       {
         profile: 'default',
@@ -659,13 +666,15 @@ describe('runUpdate', () => {
         credentialsPath,
         fetchImpl: fetchImpl as unknown as typeof fetch,
         stdout: () => {},
-        stderr: () => {},
+        stderr: line => err.push(line),
       },
     );
 
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(result.id).toBe('proj_dry');
     expect(result.updatedFields).toContain('name');
+    // DEV-247: the canned sample must carry the "not from the server" banner.
+    expect(err).toContain(DRY_RUN_BANNER);
   });
 
   it('P7 — renders text mode with updatedFields and updatedAt', async () => {

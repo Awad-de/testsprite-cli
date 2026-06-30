@@ -8,13 +8,14 @@
  * the full http+fetch path is wired against MSW).
  */
 
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   applyFailedOnly,
   assertContextIntegrity,
+  assertNoEscape,
   BUNDLE_SCHEMA_VERSION,
   buildMeta,
   pickCodeExtension,
@@ -22,6 +23,7 @@ import {
   STREAM_URL_MAX_RETRIES,
   streamUrlToFile,
   stepFilenamePrefix,
+  writeBundle,
   type AssertContextIntegrityOptions,
 } from './bundle.js';
 import type { CliFailureContext } from '../commands/test.js';
@@ -43,7 +45,9 @@ const baseCtx: CliFailureContext = {
     targetUrl: 'https://staging.example.com/checkout',
     failedStepIndex: 5,
     failureKind: 'assertion',
-    summary: { passed: 4, failed: 1, skipped: 0 },
+    verdict: 'failed',
+    executionStatus: 'completed',
+    summary: 'Failed (assertion) on step 5: assertion error.',
   },
   steps: [3, 4, 5, 6, 7].map(i => ({
     testId: 'test_failed',
@@ -528,9 +532,9 @@ describe('pickCodeExtension', () => {
     expect(pickCodeExtension('javascript', 'playwright')).toBe('js');
   });
 
-  it('falls back to framework when language is unknown', () => {
+  it('falls back to Python when the language is unknown (both frameworks are Python)', () => {
     expect(pickCodeExtension('opaque', 'pytest')).toBe('py');
-    expect(pickCodeExtension('opaque', 'playwright')).toBe('ts');
+    expect(pickCodeExtension('opaque', 'playwright')).toBe('py');
   });
 });
 
@@ -687,5 +691,140 @@ describe('streamUrlToFile retry', () => {
     ).rejects.toThrow();
     expect(sleepDelays).toHaveLength(STREAM_URL_MAX_RETRIES - 1);
     expect(sleepDelays.every(d => d > 0)).toBe(true);
+  });
+});
+
+describe('step artifact path validation', () => {
+  // A fetchImpl that fails the test if called — proves validation rejects
+  // before any write happens.
+  const throwIfFetched = (() => {
+    throw new Error('fetchImpl must not be called — validation should reject first');
+  }) as unknown as typeof globalThis.fetch;
+
+  // Single-step context that passes assertContextIntegrity (no video, no
+  // evidence, failedStepIndex null) so the only thing under test is the
+  // step's stepIndex flowing into writeStepArtifacts.
+  function stepCtx(stepIndex: unknown, htmlSnapshotUrl: string | null = null): CliFailureContext {
+    return {
+      ...baseCtx,
+      result: { ...baseCtx.result, videoUrl: null, failedStepIndex: null },
+      steps: [
+        {
+          ...baseCtx.steps[0]!,
+          stepIndex: stepIndex as number,
+          screenshotUrl: null,
+          htmlSnapshotUrl,
+          runIdIfAvailable: 'run_abc',
+        },
+      ],
+      failure: { ...baseCtx.failure, evidence: [] },
+    };
+  }
+
+  it('writeBundle rejects a malformed stepIndex and writes nothing outside the bundle dir', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'bundle-test-'));
+    const dir = join(parent, 'bundle');
+    // From <dir>/.tmp/steps, three "../" segments resolve above the bundle dir.
+    const forged = stepCtx('../../../escaped', 'https://signed.example.com/x.html');
+    const okFetch = (async () =>
+      new Response('<html>planted</html>', { status: 200 })) as unknown as typeof globalThis.fetch;
+    await expect(
+      writeBundle(forged, { dir, failedOnly: false, fetchImpl: okFetch }),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'stepIndex' }),
+    });
+    // The planted file must NOT exist outside the bundle dir.
+    expect(existsSync(join(parent, 'escaped-snapshot.html'))).toBe(false);
+  });
+
+  it('writeBundle rejects a non-integer stepIndex', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bundle-test-'));
+    await expect(
+      writeBundle(stepCtx(1.5), { dir, failedOnly: false, fetchImpl: throwIfFetched }),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'stepIndex' }),
+    });
+  });
+
+  it('writeBundle rejects a negative stepIndex', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bundle-test-'));
+    await expect(
+      writeBundle(stepCtx(-1), { dir, failedOnly: false, fetchImpl: throwIfFetched }),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'stepIndex' }),
+    });
+  });
+
+  it('writeBundle rejects a malformed evidence.kind', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'bundle-test-'));
+    const dir = join(parent, 'bundle');
+    const forged: CliFailureContext = {
+      ...baseCtx,
+      result: { ...baseCtx.result, videoUrl: null, failedStepIndex: 3 },
+      steps: [
+        {
+          ...baseCtx.steps[0]!,
+          stepIndex: 3,
+          screenshotUrl: null,
+          htmlSnapshotUrl: null,
+          runIdIfAvailable: 'run_abc',
+        },
+      ],
+      failure: {
+        ...baseCtx.failure,
+        evidence: [
+          {
+            kind: '../../../evil' as unknown as 'snapshot',
+            stepIndex: 3,
+            url: 'https://signed.example.com/ev/3.html',
+            summary: 's',
+          },
+        ],
+      },
+    };
+    const okFetch = (async () =>
+      new Response('planted', { status: 200 })) as unknown as typeof globalThis.fetch;
+    await expect(
+      writeBundle(forged, { dir, failedOnly: false, fetchImpl: okFetch }),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'kind' }),
+    });
+  });
+
+  it('writeBundle writes a well-formed bundle (guards do not break the happy path)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bundle-test-'));
+    const res = await writeBundle(stepCtx(3), {
+      dir,
+      failedOnly: false,
+      fetchImpl: throwIfFetched,
+    });
+    expect(res.files).toContain('meta.json');
+    expect(existsSync(join(res.dir, 'meta.json'))).toBe(true);
+  });
+
+  describe('assertNoEscape', () => {
+    it('returns the resolved path for an in-bounds segment', () => {
+      const base = mkdtempSync(join(tmpdir(), 'bundle-test-'));
+      expect(assertNoEscape(base, '01-snapshot.html')).toBe(join(base, '01-snapshot.html'));
+    });
+
+    it('throws VALIDATION_ERROR for an out-of-bounds segment', () => {
+      const base = mkdtempSync(join(tmpdir(), 'bundle-test-'));
+      expect(() => assertNoEscape(base, '../../../evil')).toThrowError(
+        expect.objectContaining({ code: 'VALIDATION_ERROR' }),
+      );
+    });
+
+    it('throws VALIDATION_ERROR for an absolute segment', () => {
+      const base = mkdtempSync(join(tmpdir(), 'bundle-test-'));
+      expect(() => assertNoEscape(base, '/etc/evil')).toThrowError(
+        expect.objectContaining({ code: 'VALIDATION_ERROR' }),
+      );
+    });
   });
 });

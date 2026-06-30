@@ -104,7 +104,9 @@ const CANNED_LATEST_RESULT: CliLatestResult = {
   targetUrl: 'https://example.com',
   failedStepIndex: null,
   failureKind: null,
-  summary: { passed: 5, failed: 0, skipped: 0 },
+  verdict: 'passed',
+  executionStatus: 'completed',
+  summary: 'Test passed.',
 };
 
 function errorEnvelope(code: string): unknown {
@@ -1008,7 +1010,9 @@ describe('runResult — back-compat (M2 latest result)', () => {
     );
 
     const output = lines.join('\n');
-    expect(output).toMatch(/status:\s+passed/);
+    // text mode now leads with verdict (outcome) instead of the
+    // conflated status line.
+    expect(output).toMatch(/verdict:\s+passed/);
     expect(output).toMatch(/snapshotId:\s+snap_001/);
     // Must NOT look like a history table (no RUN ID header)
     expect(output).not.toMatch(/RUN ID\s+STATUS/);

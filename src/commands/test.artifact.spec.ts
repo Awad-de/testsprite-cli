@@ -20,6 +20,7 @@ import type { CliFailureContext, CliLatestResult, CliTestStep } from './test.js'
 import {
   assertOutDirParentExists,
   createTestArtifactCommand,
+  createTestCommand,
   runArtifactGet,
   runFailureGet,
 } from './test.js';
@@ -91,7 +92,9 @@ function makeArtifactContext(overrides: Partial<CliFailureContext> = {}): CliFai
     targetUrl: 'https://staging.example.com/checkout',
     failedStepIndex: 5,
     failureKind: 'assertion',
-    summary: { passed: 4, failed: 1, skipped: 0 },
+    verdict: 'failed',
+    executionStatus: 'completed',
+    summary: 'Failed (assertion) on step 5: assertion error.',
     ...overrides.result,
   };
   return {
@@ -796,7 +799,9 @@ describe('runFailureGet M2 non-regression (requireRunId is opt-in)', () => {
         targetUrl: 'https://example.com',
         failedStepIndex: 1,
         failureKind: 'assertion',
-        summary: { passed: 0, failed: 1, skipped: 0 },
+        verdict: 'failed',
+        executionStatus: 'completed',
+        summary: 'Failed (assertion) on step 1: assertion error.',
       },
       steps: [
         {
@@ -870,5 +875,116 @@ describe('runFailureGet M2 non-regression (requireRunId is opt-in)', () => {
     const meta = JSON.parse(readFileSync(join(outDir, 'meta.json'), 'utf8'));
     expect(meta.runIdIfAvailable).toBeNull();
     expect(meta.testId).toBe('test_m2');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEV-230 — noun-level pass-through aliases
+//   `test failure <id>`   → `test failure get <id>`
+//   `test artifact <id>`  → `test artifact get <run-id>`
+// Implemented via Commander `isDefault: true` on each group's `get` subcommand.
+// Routing is proven by the endpoint each handler hits:
+//   failure get     → GET /tests/{testId}/failure
+//   failure summary → GET /tests/{testId}/failure/summary
+//   artifact get    → GET /runs/{runId}/failure
+// ---------------------------------------------------------------------------
+
+describe('DEV-230 noun-level pass-through aliases', () => {
+  it('`test failure <id>` routes to failure get (GET /tests/{id}/failure)', async () => {
+    const { credentialsPath } = makeCreds();
+    const urls: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      urls.push(url);
+      return { body: makeArtifactContext() };
+    });
+    const test = createTestCommand({ credentialsPath, fetchImpl, stdout: () => {} });
+
+    await test.parseAsync(['failure', 'test_alias_fe'], { from: 'user' });
+
+    const apiUrls = urls.filter(u => !u.includes('signed.example.com'));
+    expect(apiUrls.some(u => u.includes('/tests/test_alias_fe/failure'))).toBe(true);
+    // It must NOT have been treated as the summary sub-verb.
+    expect(apiUrls.some(u => u.includes('/failure/summary'))).toBe(false);
+  });
+
+  it('`test failure get <id>` still works unchanged', async () => {
+    const { credentialsPath } = makeCreds();
+    const urls: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      urls.push(url);
+      return { body: makeArtifactContext() };
+    });
+    const test = createTestCommand({ credentialsPath, fetchImpl, stdout: () => {} });
+
+    await test.parseAsync(['failure', 'get', 'test_explicit_fe'], { from: 'user' });
+
+    const apiUrls = urls.filter(u => !u.includes('signed.example.com'));
+    expect(apiUrls.some(u => u.includes('/tests/test_explicit_fe/failure'))).toBe(true);
+    expect(apiUrls.some(u => u.includes('/failure/summary'))).toBe(false);
+  });
+
+  it('`test failure summary <id>` is NOT swallowed by the default get (id binds to the 2nd token)', async () => {
+    const { credentialsPath } = makeCreds();
+    const urls: string[] = [];
+    const summary = {
+      testId: 'test_summary_fe',
+      status: 'failed',
+      failureKind: 'assertion',
+      snapshotId: 'snap_alias',
+      rootCauseHypothesis: null,
+      recommendedFixTarget: null,
+    };
+    const fetchImpl = makeFetch(url => {
+      urls.push(url);
+      return { body: summary };
+    });
+    const test = createTestCommand({ credentialsPath, fetchImpl, stdout: () => {} });
+
+    await test.parseAsync(['failure', 'summary', 'test_summary_fe'], { from: 'user' });
+
+    const apiUrls = urls.filter(u => !u.includes('signed.example.com'));
+    // The summary endpoint must be hit with the id as the 2nd token — proving
+    // 'summary' was resolved as the sub-verb, not consumed as a test-id by `get`.
+    expect(apiUrls.some(u => u.includes('/tests/test_summary_fe/failure/summary'))).toBe(true);
+    expect(apiUrls.some(u => u.includes('/tests/summary/failure'))).toBe(false);
+  });
+
+  it('`test artifact <run-id>` routes to artifact get (GET /runs/{runId}/failure), preserving run-id semantics', async () => {
+    const { credentialsPath } = makeCreds();
+    const outDir = await mkdtemp(join(tmpdir(), 'cli-alias-art-'));
+    const urls: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      urls.push(url);
+      return { body: makeArtifactContext() };
+    });
+    const test = createTestCommand({ credentialsPath, fetchImpl, stdout: () => {} });
+
+    // SAMPLE_RUN_ID matches makeArtifactContext()'s runId so the run-scoped
+    // `requireRunId` integrity check passes; the URL still proves the bare-noun
+    // positional was forwarded to the run-scoped endpoint as a run-id.
+    await test.parseAsync(['artifact', SAMPLE_RUN_ID, '--out', outDir], { from: 'user' });
+
+    const apiUrls = urls.filter(u => !u.includes('signed.example.com'));
+    expect(apiUrls.some(u => u.includes(`/runs/${SAMPLE_RUN_ID}/failure`))).toBe(true);
+    // The positional is a run-id, so it must NOT be mapped onto a /tests/ path.
+    expect(apiUrls.some(u => u.includes(`/tests/${SAMPLE_RUN_ID}/`))).toBe(false);
+  });
+
+  it('`test artifact get <run-id>` still works unchanged', async () => {
+    const { credentialsPath } = makeCreds();
+    const outDir = await mkdtemp(join(tmpdir(), 'cli-alias-art2-'));
+    const urls: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      urls.push(url);
+      return { body: makeArtifactContext() };
+    });
+    const test = createTestCommand({ credentialsPath, fetchImpl, stdout: () => {} });
+
+    await test.parseAsync(['artifact', 'get', SAMPLE_RUN_ID, '--out', outDir], {
+      from: 'user',
+    });
+
+    const apiUrls = urls.filter(u => !u.includes('signed.example.com'));
+    expect(apiUrls.some(u => u.includes(`/runs/${SAMPLE_RUN_ID}/failure`))).toBe(true);
   });
 });

@@ -196,11 +196,18 @@ export type CliFailureKind =
   | 'unknown'
   | null;
 
-export interface CliResultSummary {
-  passed: number;
-  failed: number;
-  skipped: number;
-}
+/** test VERDICT (the outcome of a completed run). */
+export type CliVerdict = 'passed' | 'failed' | 'blocked';
+
+/** execution LIFECYCLE (where the test is in its run lifecycle). */
+export type CliExecutionStatus =
+  | 'draft'
+  | 'ready'
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'cancelled'
+  | 'unknown';
 
 /** §6.5 LatestResult wire shape. All correlation fields are required. */
 export interface CliLatestResult {
@@ -233,7 +240,20 @@ export interface CliLatestResult {
   targetUrlSource?: 'run' | 'project-default' | 'unresolved' | null;
   failedStepIndex: number | null;
   failureKind: CliFailureKind;
-  summary: CliResultSummary;
+  /**
+   * the test VERDICT only (`passed | failed | blocked`), or `null`
+   * when the latest run produced no verdict yet (never run / queued / running /
+   * cancelled). Lifecycle lives in `executionStatus`; `status` above is the
+   * legacy conflated field, retained for back-compat.
+   */
+  verdict: CliVerdict | null;
+  /** the execution LIFECYCLE (terminal runs collapse to `completed`). */
+  executionStatus: CliExecutionStatus;
+  /**
+   * a human/agent-readable description of the latest run (replaces the
+   * former `{passed,failed,skipped}` count object).
+   */
+  summary: string;
   /**
    * §6.5.1 (M2.1 piece 3) — inline failure analysis. Present when the
    * caller passed `--include-analysis` (`?includeAnalysis=true` on
@@ -676,6 +696,7 @@ export async function runCreate(
       },
     });
   }
+  assertPythonCodeFile(opts.codeFile);
   if (!['frontend', 'backend'].includes(opts.type)) {
     throw localValidationError('type', 'must be one of: frontend, backend', [
       'frontend',
@@ -840,6 +861,16 @@ export async function runCreate(
  * — kept readable for debug-event captures.
  */
 const DRY_RUN_PLACEHOLDER_CODE = '// dry-run placeholder code body';
+
+function assertPythonCodeFile(path: string): void {
+  if (!path.toLowerCase().endsWith('.py')) {
+    throw localValidationError(
+      'code-file',
+      'must be a Python (.py) file — TestSprite runs all test code as Python ' +
+        '(frontend: Playwright for Python; backend: requests + pytest).',
+    );
+  }
+}
 
 /**
  * Read the code body with a `stat`-first size guard so an oversize
@@ -3317,7 +3348,12 @@ export interface CliPutTestCodeResponse {
 }
 
 type CodePutLanguage = CliTestCode['language'];
-const CODE_PUT_LANGUAGES: ReadonlyArray<CodePutLanguage> = ['typescript', 'javascript', 'python'];
+// Only `python` is accepted as a `--language` INPUT: TestSprite executes
+// stored test code as Python (FE Playwright `playwright.async_api`, BE
+// `requests`/pytest), so accepting `typescript`/`javascript` would be a
+// false promise. The read-side `CliTestCode['language']` union keeps ts/js
+// for wire fidelity with legacy rows the server may still return.
+const CODE_PUT_LANGUAGES: ReadonlyArray<CodePutLanguage> = ['python'];
 
 interface CodePutOptions extends CommonOptions {
   testId: string;
@@ -3389,6 +3425,7 @@ export async function runCodePut(
   assertIdempotencyKey(opts.idempotencyKey);
   requireNonEmpty('test-id', opts.testId);
   requireNonEmpty('code-file', opts.codeFile);
+  assertPythonCodeFile(opts.codeFile);
 
   if (opts.expectedVersion !== undefined && opts.force === true) {
     throw localValidationError(
@@ -4293,7 +4330,12 @@ interface ResultReadClient {
  * round-2: don't fabricate blank correlation fields).
  */
 function backendResultToRunResponse(result: CliLatestResult, run: RunResponse): RunResponse {
-  const total = result.summary.passed + result.summary.failed + result.summary.skipped;
+  // `result.summary` is now a semantic string, not a count object.
+  // Reconstruct the synthetic 1-test stepSummary from the verdict (byte-identical
+  // to the prior status-derived counts: passed→1/0, failed→0/1, else→0/0).
+  const passedCount = result.status === 'passed' ? 1 : 0;
+  const failedCount = result.status === 'failed' ? 1 : 0;
+  const total = passedCount + failedCount;
   return {
     ...run,
     status: result.status as RunStatus,
@@ -4311,9 +4353,9 @@ function backendResultToRunResponse(result: CliLatestResult, run: RunResponse): 
     videoUrl: result.videoUrl,
     stepSummary: {
       total,
-      completed: result.summary.passed + result.summary.failed,
-      passedCount: result.summary.passed,
-      failedCount: result.summary.failed,
+      completed: total,
+      passedCount,
+      failedCount,
     },
   };
 }
@@ -5054,6 +5096,9 @@ export async function runTestRunAll(
 
   // --- Dry-run path ---
   if (opts.dryRun) {
+    // DEV-247: this path returns before makeClient() fires the banner, so emit it
+    // here — otherwise the canned sample can be mistaken for a live response.
+    emitDryRunBanner(stderrFn);
     const idempotencyKey = opts.idempotencyKey ?? `dry-run-${randomUUID()}`;
     const batchRunSample = findSample('POST', '/api/cli/v1/tests/batch/run')?.body();
     const envelope = {
@@ -8330,7 +8375,10 @@ function renderResultText(r: CliLatestResult): string {
   // when the run failed; passing/running runs render in chronological
   // order so a glance reads like a timeline.
   const lines: string[] = [];
-  lines.push(`status:             ${r.status}`);
+  // surface verdict (outcome) and executionStatus (lifecycle) instead
+  // of the legacy conflated `status` (still present on the JSON wire shape).
+  lines.push(`verdict:            ${r.verdict ?? '— (no verdict yet)'}`);
+  lines.push(`executionStatus:    ${r.executionStatus}`);
   lines.push(`testId:             ${r.testId}`);
   if (r.failureKind !== null) lines.push(`failureKind:        ${r.failureKind}`);
   if (r.failedStepIndex !== null) lines.push(`failedStepIndex:    ${r.failedStepIndex}`);
@@ -8340,9 +8388,7 @@ function renderResultText(r: CliLatestResult): string {
   if (r.runIdIfAvailable !== null) lines.push(`runId:              ${r.runIdIfAvailable}`);
   if (r.codeVersion !== null) lines.push(`codeVersion:        ${r.codeVersion}`);
   if (r.targetUrl !== null) lines.push(`targetUrl:          ${r.targetUrl}`);
-  lines.push(
-    `summary:            passed=${r.summary.passed} failed=${r.summary.failed} skipped=${r.summary.skipped}`,
-  );
+  lines.push(`summary:            ${r.summary}`);
   if (r.videoUrl !== null) lines.push(`videoUrl:           ${r.videoUrl}`);
   if (r.failureAnalysisUrl !== null) lines.push(`failureAnalysisUrl: ${r.failureAnalysisUrl}`);
   if (r.analysis !== undefined) {
@@ -8450,7 +8496,7 @@ function createTestCodeCommand(deps: TestDeps): Command {
     )
     .option(
       '--language <lang>',
-      'override the stored language (typescript|javascript|python). Defaults to the existing language.',
+      'set the stored code language; only "python" is supported (TestSprite executes test code as Python). Defaults to the existing language.',
     )
     .option(
       '--idempotency-key <token>',
@@ -8570,7 +8616,11 @@ export function createTestArtifactCommand(deps: TestDeps): Command {
     'Download run-scoped artifact bundles (M3.3 piece-4)',
   );
   artifact
-    .command('get <run-id>')
+    // `isDefault: true` makes `test artifact <run-id>` a pass-through alias for
+    // `test artifact get <run-id>` (DEV-230 grammar consistency — bare-noun reads
+    // mirror the flat `test result/steps/get <id>` forms). Run-id semantics are
+    // preserved: the positional is still a run-id, not a test-id.
+    .command('get <run-id>', { isDefault: true })
     .description(
       [
         'Download the §7 failure-context bundle for a specific run.',
@@ -8614,7 +8664,10 @@ export function createTestArtifactCommand(deps: TestDeps): Command {
 function createTestFailureCommand(deps: TestDeps): Command {
   const failure = new Command('failure').description('Export the latest-failure agent bundle');
   failure
-    .command('get <test-id>')
+    // `isDefault: true` makes `test failure <test-id>` a pass-through alias for
+    // `test failure get <test-id>` (DEV-230 grammar consistency). `failure summary`
+    // still routes explicitly; only the bare-noun form falls through to `get`.
+    .command('get <test-id>', { isDefault: true })
     .description("Write a self-contained failure-context bundle for a test's latest failing run")
     .option(
       '--out <dir>',

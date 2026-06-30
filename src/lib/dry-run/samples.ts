@@ -151,16 +151,31 @@ const tests: CliTest[] = [
 
 const testCode: CliTestCode = {
   testId: SAMPLE_TEST_ID_FAILED,
-  language: 'typescript',
+  language: 'python',
   framework: 'playwright',
+  // TestSprite test code is Python: frontend tests are Playwright
+  // (`playwright.async_api`); backend tests use `requests` + assertions.
   code: [
-    "import { test, expect } from '@playwright/test';",
-    "test('checkout happy path', async ({ page }) => {",
-    '  await page.goto(process.env.TARGET_URL!);',
-    '  await page.click(\'[data-testid="cart"]\');',
-    '  await page.click(\'[data-testid="submit"]\');',
-    "  await expect(page.getByRole('heading', { name: 'Order placed' })).toBeVisible();",
-    '});',
+    'import asyncio',
+    'from playwright.async_api import async_playwright, expect',
+    '',
+    '',
+    'async def run_test():',
+    '    async with async_playwright() as pw:',
+    '        browser = await pw.chromium.launch(headless=True)',
+    '        context = await browser.new_context()',
+    '        page = await context.new_page()',
+    '        try:',
+    '            await page.goto("https://example.com")  # target URL injected by the runner',
+    '            await page.click(\'[data-testid="cart"]\')',
+    '            await page.click(\'[data-testid="submit"]\')',
+    '            await expect(page.get_by_role("heading", name="Order placed")).to_be_visible()',
+    '        finally:',
+    '            await context.close()',
+    '            await browser.close()',
+    '',
+    '',
+    'asyncio.run(run_test())',
     '',
   ].join('\n'),
   codeVersion: 'v3',
@@ -233,7 +248,9 @@ const latestResult: CliLatestResult = {
   targetUrlSource: 'run',
   failedStepIndex: 5,
   failureKind: 'assertion',
-  summary: { passed: 4, failed: 1, skipped: 0 },
+  verdict: 'failed',
+  executionStatus: 'completed',
+  summary: 'Failed (assertion) on step 5: expected cart badge to show 1 item, but it was empty.',
 };
 
 const failureContext: CliFailureContext = {
