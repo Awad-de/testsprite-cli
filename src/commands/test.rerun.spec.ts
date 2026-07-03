@@ -4630,3 +4630,78 @@ describe('rerun --wait — dashboardUrl on terminal output', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// TimeoutError on single FE rerun --wait: partial stdout + exit 7
+// ---------------------------------------------------------------------------
+
+describe('[finding-4] single FE rerun --wait: TimeoutError writes partial JSON to stdout', () => {
+  it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
+    const creds = makeCreds();
+    const rerunResp = makeFeRerunResp();
+
+    let fetchCallCount = 0;
+    const fetchImpl: typeof globalThis.fetch = async (input, _init) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      fetchCallCount++;
+      if (url.includes('/tests/test_fe_01/runs/rerun')) {
+        return new Response(JSON.stringify(rerunResp), {
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.includes('/runs/')) {
+        const runningRun: RunResponse = {
+          ...makeTerminalRun(rerunResp.runId, 'passed'),
+          status: 'running',
+          finishedAt: null,
+        };
+        return new Response(JSON.stringify(runningRun), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ error: { code: 'NOT_FOUND' } }), { status: 404 });
+    };
+
+    const stdoutLines: string[] = [];
+
+    const err = await runTestRerun(
+      {
+        testIds: ['test_fe_01'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 0,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl: fetchImpl as unknown as FetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+      },
+    ).catch(e => e);
+
+    expect(err).toMatchObject({ exitCode: 7 });
+    expect(stdoutLines.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(stdoutLines.join('\n')) as { runId: string; status: string };
+    expect(parsed.runId).toBe(rerunResp.runId);
+    expect(parsed.status).toBe('running');
+
+    void fetchCallCount;
+  });
+});
