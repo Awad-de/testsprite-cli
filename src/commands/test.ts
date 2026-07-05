@@ -7169,6 +7169,25 @@ export interface ArtifactGetResult {
   bundle?: WriteBundleResult;
 }
 
+export function resolveDefaultArtifactDir(runId: string, cwd: string = process.cwd()): string {
+  requireNonEmpty('run-id', runId);
+  const windowsNormalizedSegment = runId.replace(/[ .]+$/u, '');
+  if (
+    windowsNormalizedSegment === '' ||
+    windowsNormalizedSegment === '.' ||
+    windowsNormalizedSegment === '..' ||
+    runId.includes('/') ||
+    runId.includes('\\') ||
+    runId.includes('\0')
+  ) {
+    throw localValidationError(
+      'run-id',
+      'must be a single path-safe segment for the default output directory; pass --out <dir> to choose a custom path',
+    );
+  }
+  return join(cwd, '.testsprite', 'runs', runId);
+}
+
 /**
  * Validate that the parent directory of `resolvedDir` exists and is a
  * directory. Surfaces `VALIDATION_ERROR` (exit 5) — matches the convention
@@ -7218,14 +7237,11 @@ export async function runArtifactGet(
   deps: TestDeps = {},
 ): Promise<ArtifactGetResult> {
   const out = makeOutput(opts.output, deps);
-  const client = makeClient(opts, deps);
   const { runId } = opts;
 
   // Resolve output dir: explicit --out or the default .testsprite/runs/<runId>/
   const resolvedDir =
-    opts.out !== undefined
-      ? resolveBundleDir(opts.out)
-      : join(process.cwd(), '.testsprite', 'runs', runId);
+    opts.out !== undefined ? resolveBundleDir(opts.out) : resolveDefaultArtifactDir(runId);
 
   // --dry-run: no network, no disk write.
   // The client (makeClient) is already wired with createDryRunFetch() when
@@ -7270,6 +7286,8 @@ export async function runArtifactGet(
   if (opts.out !== undefined) {
     await assertOutDirParentExists(resolvedDir);
   }
+
+  const client = makeClient(opts, deps);
 
   // Fetch the run-scoped failure bundle.
   const { body: context, requestId: fetchRequestId } = await client.getWithMeta<CliFailureContext>(
