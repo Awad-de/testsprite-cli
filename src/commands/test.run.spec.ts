@@ -1936,6 +1936,74 @@ describe('runTestRun --wait: Fix 3 — RequestTimeoutError writes partial JSON t
 });
 
 // ---------------------------------------------------------------------------
+// TimeoutError on --wait: partial stdout + exit 7
+// ---------------------------------------------------------------------------
+
+describe('runTestRun --wait: TimeoutError writes partial JSON to stdout', () => {
+  it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
+    const { credentialsPath } = makeCreds();
+    let dateCallCount = 0;
+    let fetchCallCount = 0;
+    const base = Date.now();
+    const realDateNow = Date.now;
+    Date.now = () => (++dateCallCount > 6 ? base + 2000 : base);
+
+    try {
+      const fetchImpl: typeof globalThis.fetch = async () => {
+        ++fetchCallCount;
+        if (fetchCallCount === 1) {
+          return new Response(JSON.stringify(TRIGGER_RESP), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        const runningRun: RunResponse = { ...makePassedRun(), status: 'running' };
+        return new Response(JSON.stringify(runningRun), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+
+      const stdoutLines: string[] = [];
+      const stderrLines: string[] = [];
+
+      await expect(
+        runTestRun(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            verbose: false,
+            dryRun: false,
+            testId: 'test_xyz',
+            wait: true,
+            timeoutSeconds: 1,
+          },
+          {
+            credentialsPath,
+            fetchImpl: fetchImpl as unknown as FetchImpl,
+            stdout: line => stdoutLines.push(line),
+            stderr: line => stderrLines.push(line),
+            sleep: instantSleep,
+          },
+        ),
+      ).rejects.toMatchObject({ exitCode: 7 });
+
+      const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
+        runId: string;
+        status: string;
+        targetUrl: string;
+      };
+      expect(stdoutJson.runId).toBe(TRIGGER_RESP.runId);
+      expect(stdoutJson.status).toBe('running');
+      expect(stdoutJson.targetUrl).toBe(TRIGGER_RESP.targetUrl);
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Fix 5 — B2(c): --timeout hint fires on default, not on explicit timeout
 // ---------------------------------------------------------------------------
 

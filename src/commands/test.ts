@@ -4861,6 +4861,26 @@ export async function runTestRun(
   } catch (err) {
     if (err instanceof TimeoutError) {
       ticker.finalize(`Run ${triggerResponse.runId} — timed out after ${opts.timeoutSeconds}s`);
+      // Mirror the RequestTimeoutError path: emit a partial run to stdout so
+      // JSON consumers and AI agents can grab the runId and chain into
+      // `testsprite test wait <runId>` without parsing the stderr error envelope.
+      const timeoutPartial = {
+        runId: triggerResponse.runId,
+        status: 'running' as const,
+        enqueuedAt: triggerResponse.enqueuedAt,
+        codeVersion: triggerResponse.codeVersion,
+        targetUrl: triggerResponse.targetUrl || null,
+      };
+      printRunOrChain(out, timeoutPartial, opts.createContext, data => {
+        const p = data as typeof timeoutPartial;
+        const lines = [
+          `runId       ${p.runId}`,
+          `status      ${p.status} (timed out after ${opts.timeoutSeconds}s)`,
+        ];
+        if (p.targetUrl) lines.push(`targetUrl   ${p.targetUrl}`);
+        lines.push(`hint        Re-attach with: testsprite test wait ${p.runId}`);
+        return lines.join('\n');
+      });
       throw ApiError.fromEnvelope({
         error: {
           code: 'UNSUPPORTED', // exit 7 per errors.md
@@ -5021,6 +5041,18 @@ export async function runTestWait(
   } catch (err) {
     if (err instanceof TimeoutError) {
       ticker.finalize(`Run ${opts.runId} — timed out after ${opts.timeoutSeconds}s`);
+      // Mirror the RequestTimeoutError path: emit a partial run to stdout so
+      // JSON consumers and AI agents can grab the runId and chain into
+      // `testsprite test wait <runId>` without parsing the stderr error envelope.
+      const timeoutPartial = { runId: opts.runId, status: 'running' as const };
+      out.print(timeoutPartial, data => {
+        const p = data as typeof timeoutPartial;
+        return [
+          `runId       ${p.runId}`,
+          `status      ${p.status} (timed out after ${opts.timeoutSeconds}s)`,
+          `hint        Re-attach with: testsprite test wait ${p.runId}`,
+        ].join('\n');
+      });
       throw ApiError.fromEnvelope({
         error: {
           code: 'UNSUPPORTED', // exit 7 per errors.md
