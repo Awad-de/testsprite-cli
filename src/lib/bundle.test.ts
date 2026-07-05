@@ -641,17 +641,24 @@ describe('streamUrlToFile retry', () => {
       calls++;
       throw new Error('ENETUNREACH dns lookup failed');
     };
-    await expect(
-      streamUrlToFile(
-        'https://example.com/x',
+    let caught: unknown;
+
+    try {
+      await streamUrlToFile(
+        'https://example.com/x?X-Amz-Signature=secret-token',
         '/tmp/will-not-be-written',
         fetchImpl as typeof globalThis.fetch,
         { sleep: noSleep },
-      ),
-    ).rejects.toMatchObject({
+      );
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toMatchObject({
       name: 'TransportError',
       message: expect.stringContaining('ENETUNREACH'),
     });
+    expect(caught).not.toMatchObject({ message: expect.stringContaining('secret-token') });
     expect(calls).toBe(STREAM_URL_MAX_RETRIES);
   });
 
@@ -661,15 +668,44 @@ describe('streamUrlToFile retry', () => {
       calls++;
       return new Response('Forbidden', { status: 403 });
     };
-    await expect(
-      streamUrlToFile(
-        'https://example.com/x',
+    let caught: unknown;
+    const presignedUrl = 'https://example.com/x?X-Amz-Signature=secret-token#download';
+
+    try {
+      await streamUrlToFile(
+        presignedUrl,
         '/tmp/will-not-be-written',
         fetchImpl as typeof globalThis.fetch,
         { sleep: noSleep },
-      ),
-    ).rejects.toMatchObject({ code: 'UNAVAILABLE' });
+      );
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toMatchObject({
+      code: 'UNAVAILABLE',
+      details: { status: 403, artifactUrl: 'https://example.com/x' },
+    });
+    const details = (caught as { details?: Record<string, unknown> }).details;
+    expect(details).not.toHaveProperty('url');
+    expect(JSON.stringify(details)).not.toContain('secret-token');
     expect(calls).toBe(1);
+  });
+
+  it('disables automatic redirects so unsafe redirect targets cannot bypass URL validation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stream-test-'));
+    const dest = join(dir, 'out.bin');
+    const redirects: Array<RequestInit['redirect']> = [];
+    const fetchImpl = async (_url: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+      redirects.push(init?.redirect);
+      return new Response('hello', { status: 200 });
+    };
+
+    await streamUrlToFile('https://example.com/x', dest, fetchImpl as typeof globalThis.fetch, {
+      sleep: noSleep,
+    });
+
+    expect(redirects).toEqual(['error']);
   });
 
   it('sleeps between retries', async () => {
