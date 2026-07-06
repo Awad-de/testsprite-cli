@@ -5951,6 +5951,22 @@ export async function runTestRunAll(
           },
         };
       }
+      if (err instanceof RequestTimeoutError) {
+        // Client-side per-request timeout during polling — classify as timeout
+        // (exit 7) so the fan-out completes and stdout carries every runId.
+        // Without this, RequestTimeoutError rejects the fan-out before out.print(),
+        // leaving JSON consumers with empty stdout (mirrors create-batch --run).
+        return {
+          testId: entry.testId,
+          runId,
+          status: 'timeout',
+          error: {
+            code: 'UNSUPPORTED',
+            message: err.message,
+            exitCode: err.exitCode,
+          },
+        };
+      }
       if (err instanceof ApiError) {
         // Preserve the real exit code + envelope (AUTH_INVALID=3, NOT_FOUND=4,
         // RATE_LIMITED=11, …) instead of flattening every member failure to 1
@@ -7157,6 +7173,22 @@ export async function runTestRerun(
             code: 'UNSUPPORTED',
             message: `Timed out after ${opts.timeoutSeconds}s`,
             exitCode: 7,
+          },
+        };
+      }
+      if (err instanceof RequestTimeoutError) {
+        // Client-side per-request timeout during polling — classify as timeout
+        // (exit 7) so the fan-out completes and stdout carries every runId.
+        // Without this, RequestTimeoutError rejects the fan-out before out.print(),
+        // leaving JSON consumers with empty stdout (mirrors create-batch --run).
+        return {
+          testId: entry.testId,
+          runId: entry.runId,
+          status: 'timeout',
+          error: {
+            code: 'UNSUPPORTED',
+            message: err.message,
+            exitCode: err.exitCode,
           },
         };
       }
