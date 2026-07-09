@@ -34,7 +34,9 @@ import {
  * The description value is a single line (no folded/literal block scalars).
  */
 function parseFrontmatterDescription(content: string): string | undefined {
-  const lines = content.split('\n');
+  // Tolerate CRLF so a Windows checkout (autocrlf) doesn't leave a trailing
+  // \r on the description and break the byte-identical comparisons.
+  const lines = content.split(/\r?\n/);
   let inFrontmatter = false;
   for (const line of lines) {
     if (line.trim() === '---') {

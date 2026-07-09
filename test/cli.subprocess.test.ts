@@ -8,7 +8,7 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -364,7 +364,10 @@ function runCli(args: string[], envOverrides: Record<string, string> = {}): Prom
       cwd: REPO_ROOT,
       env: {
         ...process.env,
+        // os.homedir() reads HOME on POSIX but USERPROFILE on Windows —
+        // set both so the child never sees the real ~/.testsprite.
         HOME: tmpHome,
+        USERPROFILE: tmpHome,
         TESTSPRITE_API_KEY: undefined,
         TESTSPRITE_API_URL: undefined,
         ...envOverrides,
@@ -897,7 +900,10 @@ describe('setup --from-env subprocess', () => {
     expect(result.exitCode).toBe(0);
     const credentialsPath = join(tmpHome, '.testsprite', 'credentials');
     expect(existsSync(credentialsPath)).toBe(true);
-    expect(statSync(credentialsPath).mode & 0o777).toBe(0o600);
+    // POSIX file modes don't exist on Windows (stat reports 0666).
+    if (process.platform !== 'win32') {
+      expect(statSync(credentialsPath).mode & 0o777).toBe(0o600);
+    }
   }, 30_000);
 
   it('exits 5 with VALIDATION_ERROR when --from-env is set without TESTSPRITE_API_KEY', async () => {
@@ -1044,7 +1050,7 @@ describe('--dry-run subprocess smoke', () => {
     // skipped the prompt.
     const credPath = join(tmpHome, '.testsprite', 'credentials');
     // Make sure any previous test didn't leave one behind.
-    if (existsSync(credPath)) execFileSync('rm', [credPath]);
+    rmSync(credPath, { force: true });
     const result = await runCli(['setup', '--dry-run', '--no-agent', '--output', 'json']);
     expect(result.exitCode).toBe(0);
     expect(existsSync(credPath)).toBe(false);
