@@ -333,6 +333,23 @@ describe('findSample', () => {
             updatedAt: expect.any(String),
           });
           break;
+        case 'cancelRun':
+          // DEV-331 piece 3 — POST /runs/{runId}/cancel → CancelRunResponse
+          // (RunResponse shape + alreadyCancelled).
+          expect(body).toMatchObject({
+            runId: expect.any(String),
+            testId: expect.any(String),
+            status: 'cancelled',
+            alreadyCancelled: false,
+          });
+          break;
+        case 'deleteProject':
+          // DELETE /projects/{id} → CliDeleteProjectResponse shape.
+          expect(body).toMatchObject({
+            projectId: expect.any(String),
+            deletedAt: expect.any(String),
+          });
+          break;
         default:
           throw new Error(`Unexpected operationId in samples: ${e.operationId}`);
       }
@@ -421,6 +438,22 @@ describe('findSample', () => {
     };
     expect(body.status).toBe('passed');
     expect(body.stepSummary.failedCount).toBe(0);
+  });
+
+  // DEV-331 piece 3: POST /runs/{runId}/cancel must resolve to `cancelRun`,
+  // never fall through to the GET-only `getRun` entry despite sharing the
+  // `/runs/{runId}` path prefix — findSample filters by method first.
+  it('POST /runs/{runId}/cancel resolves cancelRun (not getRun)', () => {
+    const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/runs/run_xyz/cancel');
+    expect(e?.operationId).toBe('cancelRun');
+    const body = e?.body() as { status: string; alreadyCancelled: boolean; runId: string };
+    expect(body.status).toBe('cancelled');
+    expect(body.alreadyCancelled).toBe(false);
+  });
+
+  it('GET /runs/{runId}/cancel has no sample (cancel is POST-only)', () => {
+    const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/runs/run_xyz/cancel');
+    expect(e).toBeUndefined();
   });
 
   it('getTest sample carries priority field (G1a)', () => {

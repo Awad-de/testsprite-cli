@@ -13,12 +13,12 @@
 # Runs with NO checkout — metadata-only, so it is safe under pull_request_target
 # (which is required for fork PRs to get a write-capable token).
 #
-# Bot identity: posts as `testsprite-hob[bot]` when the App token works. The
-# App currently has Issues R/W + Metadata only — commenting/labeling a PULL
-# REQUEST needs the "Pull requests: Read & write" App permission (issues-API
-# endpoints are permission-checked by target type). Until an org admin adds
-# that permission and re-approves the installation, every call gracefully falls
-# back to the default GITHUB_TOKEN and posts as github-actions[bot].
+# Bot identity: posts as `testsprite-hob[bot]` when the App token works (the
+# App has had the "Pull requests: Read & write" permission since 2026-07-02 —
+# corrected 2026-07-15; this comment previously said the permission was still
+# pending). The App-token-first / GITHUB_TOKEN-fallback code path below is
+# kept regardless, as defense-in-depth for whenever the App/secrets are
+# absent or a future installation loses the permission.
 # Secrets: TESTSPRITE_HOB_* preferred; the ALFHEIM_AGENT_* fallbacks are the
 # original names from before the App was renamed (same App ID + key).
 name: PR triage (issue-link gate)
@@ -60,8 +60,18 @@ jobs:
         with:
           app-id: ${{ secrets.TESTSPRITE_HOB_APP_ID || secrets.ALFHEIM_AGENT_APP_ID }}
           private-key: ${{ secrets.TESTSPRITE_HOB_PRIVATE_KEY || secrets.ALFHEIM_AGENT_PRIVATE_KEY }}
+          # Every write() call below (createComment/updateComment/addLabels/
+          # removeLabel) is an `issues.*` Octokit method — GitHub gates all
+          # four (comments AND labels, even on a PR number) on the "Issues"
+          # repository permission, not "Pull requests" (verified against
+          # docs.github.com/en/rest/using-the-rest-api/permissions-required-for-github-apps).
+          # Scoping to issues:write alone is therefore both sufficient and
+          # minimal — narrower than this job's top-level `permissions:` block,
+          # which also carries pull-requests:write for the ambient-token
+          # fallback path (unused by this specific App-token mint).
+          permission-issues: write
 
-      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.0.1
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
         with:

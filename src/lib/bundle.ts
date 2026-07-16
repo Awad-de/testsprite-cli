@@ -307,6 +307,23 @@ export function applyFailedOnly(ctx: CliFailureContext): CliFailureContext {
 }
 
 /**
+ * Strip trailing path separators, tolerating both `/` and `\` since a
+ * native Windows `--out` value (typed or pasted from Explorer) commonly
+ * ends in a backslash. Preserves a bare drive root (`C:\`) — stripping
+ * its separator would turn it into `C:`, which Windows resolves as
+ * "current directory on drive C", not the drive root.
+ */
+function stripTrailingSeparators(rawPath: string): string {
+  if (rawPath.length <= 1) return rawPath;
+  let end = rawPath.length;
+  while (end > 1 && (rawPath[end - 1] === '/' || rawPath[end - 1] === '\\')) {
+    if (end === 3 && rawPath[1] === ':' && /[A-Za-z]/.test(rawPath[0]!)) break;
+    end--;
+  }
+  return rawPath.slice(0, end);
+}
+
+/**
  * Resolve the user-supplied `--out` path into an absolute directory.
  * Empty strings are rejected with `VALIDATION_ERROR` for consistency
  * with `test code get --out`. We do NOT pre-create the directory or
@@ -325,7 +342,7 @@ export function resolveBundleDir(rawPath: string): string {
       },
     });
   }
-  const trimmed = rawPath.endsWith('/') ? rawPath.slice(0, -1) : rawPath;
+  const trimmed = stripTrailingSeparators(rawPath);
   return isAbsolute(trimmed) ? trimmed : resolve(process.cwd(), trimmed);
 }
 

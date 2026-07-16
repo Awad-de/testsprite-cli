@@ -22,6 +22,7 @@ import { emitDeprecationNotice } from '../lib/deprecate.js';
 import type { OutputMode } from '../lib/output.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptSecret } from '../lib/prompt.js';
+import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 
 export interface MeResponse {
   userId: string;
@@ -37,6 +38,11 @@ export interface MeResponse {
   email?: string;
   /** Human-readable display name for the bound account. Absent-safe (dogfood L1866). */
   displayName?: string;
+  /**
+   * Authoritative per-user V3 routing bit. Absent-safe: older backends omit it,
+   * so it is only rendered when present.
+   */
+  v3Enabled?: boolean;
 }
 
 export interface AuthDeps {
@@ -201,6 +207,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
 export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promise<MeResponse> {
   const out = makeOutput(opts.output, deps);
   const env = deps.env ?? process.env;
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   // Resolve the endpoint URL so it can be surfaced in text output.
   // Dry-run uses the flag/env/default chain without touching credentials.
@@ -244,6 +251,8 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
       `endpoint: ${resolvedEndpoint}`,
       `env:    ${m.env}`,
       `scopes: ${m.scopes.join(', ')}`,
+      // Authoritative routing mode, rendered only when the backend supplies it.
+      ...(m.v3Enabled !== undefined ? [`routing: ${routingLabel(m.v3Enabled)}`] : []),
     ];
     // C2: warn in text mode when key cannot write/run
     const missingScopes = (['write:tests', 'run:tests'] as const).filter(
@@ -256,6 +265,11 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
     }
     return lines.join('\n');
   });
+  // When V3 routing is on, warn (text mode only) about the still-open behavior
+  // gaps. JSON consumers read `v3Enabled` directly; stdout stays pure.
+  if (opts.output !== 'json' && me.v3Enabled === true) {
+    emitV3RoutingAdvisory(stderr);
+  }
   return me;
 }
 

@@ -38,10 +38,12 @@ import {
 import {
   ApiError,
   CLIError,
+  InterruptError,
   RequestTimeoutError,
   TransportError,
   localValidationError,
 } from '../lib/errors.js';
+import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
 import {
   assertIdempotencyKey,
   requireArrayLength,
@@ -75,6 +77,7 @@ import type {
   RunSource,
   BatchRunFreshResponse,
   BatchRunFreshAccepted,
+  CancelRunResponse,
 } from '../lib/runs.types.js';
 import { RUN_SOURCES } from '../lib/runs.types.js';
 import { assertNotLocal } from '../lib/target-url.js';
@@ -153,6 +156,14 @@ export interface CliTest {
    * no priority has been set. Text mode surfaces it only when truthy.
    */
   priority?: string | null;
+  /**
+   * Backend-only dependency declarations that drive wave ordering.
+   * Optional on the wire so older facades that don't ship them still
+   * type-check; text mode surfaces them only when present/non-empty.
+   */
+  produces?: string[] | null;
+  consumes?: string[] | null;
+  category?: string | null;
 }
 
 export type CliPublicStatus =
@@ -293,6 +304,18 @@ export interface CliLatestResult {
    */
   summary: string;
   /**
+   * Captured stdout (`api_output`) from a backend-test execution.
+   * Present (possibly null) only for backend tests; omitted for FE/MCP and on
+   * older backends that omit them. Capped at 50 KB UTF-8 by the server.
+   */
+  apiOutput?: string | null;
+  /**
+   * Python traceback from a backend-test execution (ends with the
+   * `ExceptionType: message` line). Present (possibly null) only for backend
+   * tests; omitted for FE/MCP and on older backends.
+   */
+  trace?: string | null;
+  /**
    * §6.5.1 (M2.1 piece 3) — inline failure analysis. Present when the
    * caller passed `--include-analysis` (`?includeAnalysis=true` on
    * the wire); absent on the byte-identical-to-pre-M2.1 default.
@@ -382,6 +405,14 @@ export interface CliFailureBlock {
    */
   recommendedFixTarget: CliFixTarget | null;
   evidence: CliEvidence[];
+  /**
+   * Backend-test execution artifacts, surfaced on the failure block
+   * so triage has stdout + traceback next to the hypothesis (mirrors
+   * `result.apiOutput` / `result.trace`). Present (possibly null) only for
+   * backend failures; omitted for FE and on older backends.
+   */
+  apiOutput?: string | null;
+  trace?: string | null;
 }
 
 /** §6.7 wire shape — one atomic snapshot of the latest failing run. */
@@ -413,6 +444,36 @@ export interface TestDeps {
    * no-op in tests to avoid real delays.
    */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Graceful-detach coordinator for the `--wait` paths (DEV-331 piece 1).
+   * Defaults to the process-wide `globalShutdown`; tests inject their own
+   * controller and abort it to simulate Ctrl-C deterministically (same
+   * pattern as `sleep` / `fetchImpl`).
+   */
+  shutdown?: ShutdownHandle;
+}
+
+/** The effective shutdown handle for a command invocation (DEV-331). */
+function shutdownOf(deps: TestDeps): ShutdownHandle {
+  return deps.shutdown ?? globalShutdown;
+}
+
+/**
+ * The honest-detach stderr line (DEV-331 D1 — the heart of the ticket):
+ * a Ctrl-C detaches the local wait only; the server-side run keeps executing
+ * AND billing. Names both re-attach (`test wait`) and the real cancel
+ * (`test cancel`, piece 3) so the user always has a path to actually stop it.
+ */
+function interruptDetachMessage(err: InterruptError, runIds: string[]): string {
+  const subject =
+    runIds.length === 1
+      ? `Run ${runIds[0]} is still executing on the server and will keep running (and billing) until it finishes.`
+      : `${runIds.length} runs are still executing on the server and will keep running (and billing) until they finish.`;
+  return (
+    `Interrupted (${err.signal}). ${subject}\n` +
+    `  Re-attach with: testsprite test wait ${runIds.join(' ')}\n` +
+    `  Cancel with:    testsprite test cancel ${runIds.join(' ')}`
+  );
 }
 
 type CommonOptions = FactoryCommonOptions;
@@ -1274,6 +1335,12 @@ interface UpdateOptions extends CommonOptions {
   description?: string;
   /** Optional new priority. Enum-validated CLI-side. */
   priority?: CliCreatePriority;
+  /** Backend-only: variable names this test produces (repeatable --produces). */
+  produces?: string[];
+  /** Backend-only: variable names this test consumes (repeatable --needs); wire field `consumes`. */
+  needs?: string[];
+  /** Backend-only: free-text wave category (--category). */
+  category?: string;
   /** Caller-supplied idempotency token; UUIDv4 minted client-side if absent. */
   idempotencyKey?: string;
 }
@@ -1330,11 +1397,14 @@ export async function runUpdate(
   const hasName = opts.name !== undefined;
   const hasDescription = opts.description !== undefined;
   const hasPriority = opts.priority !== undefined;
-  if (!hasName && !hasDescription && !hasPriority) {
+  const hasProduces = opts.produces !== undefined && opts.produces.length > 0;
+  const hasNeeds = opts.needs !== undefined && opts.needs.length > 0;
+  const hasCategory = opts.category !== undefined;
+  if (!hasName && !hasDescription && !hasPriority && !hasProduces && !hasNeeds && !hasCategory) {
     throw localValidationError(
       'fields',
-      'at least one of --name / --description / --priority must be set',
-      ['name', 'description', 'priority'],
+      'at least one of --name / --description / --priority / --produces / --needs / --category must be set',
+      ['name', 'description', 'priority', 'produces', 'needs', 'category'],
     );
   }
 
@@ -1349,10 +1419,13 @@ export async function runUpdate(
   // is the intended wire shape — but we build the body deliberately
   // so the contract is auditable rather than dependent on
   // JSON.stringify undefined-skipping.
-  const body: Record<string, string> = {};
+  const body: Record<string, string | string[]> = {};
   if (hasName) body.name = opts.name!;
   if (hasDescription) body.description = opts.description!;
   if (hasPriority) body.priority = opts.priority!;
+  if (hasProduces) body.produces = opts.produces!;
+  if (hasNeeds) body.consumes = opts.needs!;
+  if (hasCategory) body.category = opts.category!;
 
   const client = makeClient(opts, deps);
   const out = makeOutput(opts.output, deps);
@@ -2583,7 +2656,14 @@ async function runBatchRun(
    *
    * Returns a CliBatchRunResult. Never throws — errors are captured
    * into the result's `error` field so one failure doesn't abort siblings.
+   * (Exception: InterruptError rethrows so the collect point can print the
+   * partial — DEV-331.)
    */
+  // testId → dispatched runId for members still mid-poll; the interrupt
+  // partial reads it because a member's runId is local to triggerOne until
+  // the poll settles (DEV-331, codex finding 2).
+  const dispatchedRunIds = new Map<string, string>();
+
   async function triggerOne(testId: string): Promise<CliBatchRunResult> {
     // Mint a fresh idempotency key per run — MUST NOT reuse the create key.
     const runIdempotencyKey = `cli-batch-run-${randomUUID()}`;
@@ -2673,6 +2753,10 @@ async function runBatchRun(
         triggerResponse = result.body;
         break; // success — exit the outer retry loop
       } catch (err) {
+        // Interrupt must reject the fan-out (the collect point prints the
+        // partial for every spec), never flatten into a per-member outcome
+        // that would swallow the 128+signum exit (DEV-331).
+        if (err instanceof InterruptError) throw err;
         // RATE_LIMITED outer retry. Since the HTTP layer no longer retries
         // RATE_LIMITED (retryOnRateLimit: false above), every 429 reaches here
         // on the first attempt.
@@ -2809,6 +2893,12 @@ async function runBatchRun(
       }
     }
 
+    // Record the dispatched runId (fresh trigger OR conflict-resume) so the
+    // interrupt partial at the collect point can name every in-flight run —
+    // a member's runId is otherwise local until its poll settles (DEV-331,
+    // codex finding 2).
+    if (triggerResponse.runId) dispatchedRunIds.set(testId, triggerResponse.runId);
+
     if (!opts.wait) {
       // No-wait path: return the trigger response as-is.
       if (opts.output !== 'json') {
@@ -2850,11 +2940,14 @@ async function runBatchRun(
       finalRun = await pollRunUntilTerminal(client, triggerResponse.runId, {
         timeoutSeconds: remainingSeconds,
         sleep: deps.sleep,
+        shutdown: shutdownOf(deps),
         onTransition: opts.verbose
           ? (msg: string) => stderrFn(`[batch-run][verbose] ${testId}: ${msg}`)
           : undefined,
       });
     } catch (err) {
+      // Interrupt rejects the fan-out — see the trigger-stage catch above.
+      if (err instanceof InterruptError) throw err;
       if (err instanceof TimeoutError) {
         if (opts.output !== 'json') {
           stderrFn(
@@ -2920,24 +3013,59 @@ async function runBatchRun(
   let nextIdx = 0;
   let inFlight = 0;
 
-  await new Promise<void>((resolve, reject) => {
-    function startNext(): void {
-      while (inFlight < concurrencyLimit && nextIdx < testIds.length) {
-        const testId = testIds[nextIdx++]!;
-        inFlight++;
-        triggerOne(testId)
-          .then(result => {
-            batchRunResults.push(result);
-            inFlight--;
-            startNext();
-            if (inFlight === 0 && nextIdx >= testIds.length) resolve();
-          })
-          .catch(reject);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      function startNext(): void {
+        while (inFlight < concurrencyLimit && nextIdx < testIds.length) {
+          const testId = testIds[nextIdx++]!;
+          inFlight++;
+          triggerOne(testId)
+            .then(result => {
+              batchRunResults.push(result);
+              inFlight--;
+              startNext();
+              if (inFlight === 0 && nextIdx >= testIds.length) resolve();
+            })
+            .catch(reject);
+        }
+      }
+      startNext();
+      if (testIds.length === 0) resolve();
+    });
+  } catch (fanOutErr) {
+    // Graceful detach (DEV-331): leave stdout parseable — settled members keep
+    // their real status, unfinished ones are marked running — then rethrow so
+    // index.ts exits 128+signum.
+    if (fanOutErr instanceof InterruptError) {
+      const settled = new Map(batchRunResults.map(r => [r.testId, r] as const));
+      // Members mid-poll have no settled result yet — their runId comes from
+      // the dispatchedRunIds map recorded at trigger time (codex finding 2).
+      const partialResults = testIds.map(
+        (testId): CliBatchRunResult =>
+          settled.get(testId) ?? {
+            testId,
+            runId: dispatchedRunIds.get(testId) ?? '',
+            status: dispatchedRunIds.has(testId) ? 'running' : 'not_dispatched',
+            codeVersion: '',
+          },
+      );
+      out.print({ results: partialResults }, () =>
+        partialResults.map(r => `${r.testId}  ${r.runId || '-'}  ${r.status}`).join('\n'),
+      );
+      const unfinished = partialResults
+        .filter(r => r.status === 'running' && r.runId)
+        .map(r => r.runId);
+      if (unfinished.length > 0) {
+        stderrFn(interruptDetachMessage(fanOutErr, unfinished));
+      } else {
+        stderrFn(
+          `Interrupted (${fanOutErr.signal}). Already-triggered runs keep executing (and billing) server-side; ` +
+            `check them with: testsprite test list`,
+        );
       }
     }
-    startNext();
-    if (testIds.length === 0) resolve();
-  });
+    throw fanOutErr;
+  }
 
   // Sort by testId order (same as input order for stable output).
   batchRunResults.sort((a, b) => testIds.indexOf(a.testId) - testIds.indexOf(b.testId));
@@ -5101,6 +5229,36 @@ function renderRunResponseText(
 }
 
 /**
+ * Best-effort resolve whether a finished run's test is a backend test, for the
+ * text run-card's step line + failure hint only (DEV-282). Returns true with no
+ * network call when already known (create-chain `--type`, or the BE wait
+ * fallback fired). Otherwise, in TEXT mode only, issues one `GET /tests/{id}`;
+ * any error → false (render the numeric step summary as before). JSON mode
+ * never probes — its envelope carries `stepSummary` verbatim and has no
+ * "n/a (backend)" concept, so it is already correct.
+ *
+ * This closes the standalone-path gap: `test run <id>` / `test wait <run-id>`
+ * never supply a type hint, and now that BE run rows finalize server-side
+ * (backend-v2.0 #551/#555) the wait fallback rarely fires — so a backend run
+ * card would otherwise show a misleading `steps 0/0 (passed=0, failed=0)`.
+ */
+async function resolveRunCardIsBackend(
+  client: ResultReadClient,
+  testId: string | undefined,
+  output: string,
+  alreadyKnown: boolean,
+): Promise<boolean> {
+  if (alreadyKnown) return true;
+  if (output === 'json' || !testId) return false;
+  try {
+    const test = await client.get<CliTest>(`/tests/${encodeURIComponent(testId)}`);
+    return test.type === 'backend';
+  } catch {
+    return false; // best-effort — fall back to the numeric step summary.
+  }
+}
+
+/**
  * Render a `TriggerRunResponse` (no-wait path) to human-readable text.
  */
 function renderTriggerRunText(r: TriggerRunResponse): string {
@@ -5259,7 +5417,8 @@ export async function runTestRun(
           stderrFn(
             `[advisory] Run already in flight (runId: ${currentRunId}, ` +
               `target: ${inFlightRun.targetUrl}). ` +
-              `Attaching to that run's --wait poll instead of creating a new one.`,
+              `Attaching to that run's --wait poll instead of creating a new one. ` +
+              `To stop it instead: testsprite test cancel ${currentRunId}`,
           );
           triggerResponse = {
             runId: currentRunId,
@@ -5285,12 +5444,16 @@ export async function runTestRun(
 
           // Auto-resume but emit a stronger advisory so the caller is aware
           // they are attaching to the project default.
+          // SIG-9 (DEV-331 final): the in-flight run is NOT auto-cancelled —
+          // name the real `test cancel` command instead of the old (false)
+          // "cancel with Ctrl-C" claim.
           stderrFn(
             `[advisory] Run already in flight (runId: ${currentRunId}` +
               (inFlightTargetUrl ? `, target: ${inFlightTargetUrl}` : '') +
               `). Auto-resuming wait on in-flight run. ` +
-              `If you needed a specific target URL, cancel with Ctrl-C and ` +
-              `re-trigger with --target-url.`,
+              `If you needed a specific target URL, cancel it with ` +
+              `testsprite test cancel ${currentRunId}, or re-trigger with ` +
+              `--target-url after it finishes.`,
           );
           triggerResponse = {
             runId: currentRunId,
@@ -5359,6 +5522,7 @@ export async function runTestRun(
     finalRun = await pollRunUntilTerminal(client, triggerResponse.runId, {
       timeoutSeconds: opts.timeoutSeconds,
       sleep: deps.sleep,
+      shutdown: shutdownOf(deps),
       onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
       onTick: (run, elapsedMs) => {
         const elapsed = Math.round(elapsedMs / 1000);
@@ -5390,13 +5554,14 @@ export async function runTestRun(
         ];
         if (p.targetUrl) lines.push(`targetUrl   ${p.targetUrl}`);
         lines.push(`hint        Re-attach with: testsprite test wait ${p.runId}`);
+        lines.push(`hint        Cancel with:    testsprite test cancel ${p.runId}`);
         return lines.join('\n');
       });
       throw ApiError.fromEnvelope({
         error: {
           code: 'UNSUPPORTED', // exit 7 per errors.md
           message: `Timed out after ${opts.timeoutSeconds}s waiting for run ${triggerResponse.runId}.`,
-          nextAction: `Resume polling: testsprite test wait ${triggerResponse.runId}`,
+          nextAction: `Resume polling: testsprite test wait ${triggerResponse.runId}, or cancel it: testsprite test cancel ${triggerResponse.runId}`,
           requestId: 'local',
           details: { runId: triggerResponse.runId, timeoutSeconds: opts.timeoutSeconds },
         },
@@ -5423,12 +5588,37 @@ export async function runTestRun(
         const lines = [`runId       ${p.runId}`, `status      ${p.status} (request timed out)`];
         if (p.targetUrl) lines.push(`targetUrl   ${p.targetUrl}`);
         lines.push(`hint        Re-attach with: testsprite test wait ${p.runId}`);
+        lines.push(`hint        Cancel with:    testsprite test cancel ${p.runId}`);
         return lines.join('\n');
       });
       stderrFn(
         `Run ${triggerResponse.runId} is still in progress (request timed out). ` +
-          `Re-attach with: testsprite test wait ${triggerResponse.runId}`,
+          `Re-attach with: testsprite test wait ${triggerResponse.runId}, or cancel with: testsprite test cancel ${triggerResponse.runId}`,
       );
+      throw err;
+    }
+    // Graceful detach on SIGINT/SIGTERM (DEV-331 piece 1): same partial-
+    // envelope shape as the timeout paths so stdout stays parseable, plus the
+    // honest "keeps running and billing" stderr line. Rethrow → index.ts
+    // renders the INTERRUPTED envelope and exits 128+signum.
+    if (err instanceof InterruptError) {
+      ticker.finalize(`Run ${triggerResponse.runId} — interrupted (${err.signal})`);
+      const partial = {
+        runId: triggerResponse.runId,
+        status: 'running' as const,
+        enqueuedAt: triggerResponse.enqueuedAt,
+        codeVersion: triggerResponse.codeVersion,
+        targetUrl: triggerResponse.targetUrl || null,
+      };
+      printRunOrChain(out, partial, opts.createContext, data => {
+        const p = data as typeof partial;
+        const lines = [`runId       ${p.runId}`, `status      ${p.status} (interrupted)`];
+        if (p.targetUrl) lines.push(`targetUrl   ${p.targetUrl}`);
+        lines.push(`hint        Re-attach with: testsprite test wait ${p.runId}`);
+        lines.push(`hint        Cancel with:    testsprite test cancel ${p.runId}`);
+        return lines.join('\n');
+      });
+      stderrFn(interruptDetachMessage(err, [triggerResponse.runId]));
       throw err;
     }
     ticker.finalize();
@@ -5441,16 +5631,21 @@ export async function runTestRun(
     `Run ${finalRun.runId} — ${finalRun.status} (${s.completed}/${s.total} steps elapsed=${elapsed}s)`,
   );
 
+  // BE detection: type hint (create-chain) OR beFallbackUsed (slow runs); on
+  // the standalone `test run <id>` path neither is set, so probe the test type
+  // once (text mode only, best-effort) — DEV-282.
+  const isBackend = await resolveRunCardIsBackend(
+    client,
+    opts.testId,
+    opts.output,
+    beFallbackUsed || opts.type === 'backend',
+  );
+
   printRunOrChain(
     out,
     withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)),
     opts.createContext,
-    data =>
-      renderRunResponseText(data as RunResponse, {
-        // BE detection: type hint (create-chain) OR beFallbackUsed (slow runs).
-        // This ensures fast BE runs terminal on first poll still render n/a.
-        isBackend: beFallbackUsed || opts.type === 'backend',
-      }),
+    data => renderRunResponseText(data as RunResponse, { isBackend }),
   );
 
   // Surface the trigger requestId under --verbose/--debug or JSON mode so
@@ -5460,10 +5655,10 @@ export async function runTestRun(
     stderrFn(`requestId: ${triggerRequestId}`);
 
   if (finalRun.status === 'failed' || finalRun.status === 'blocked') {
-    // BE runs (resolved via the testId fallback) have no run-scoped artifact
-    // bundle — their failure bundle is addressed by testId, not runId.
+    // BE runs have no run-scoped artifact bundle — their failure bundle is
+    // addressed by testId, not runId.
     stderrFn(
-      beFallbackUsed
+      isBackend
         ? `Run finished with status: ${finalRun.status}. Backend failure artifacts are addressed by testId — use 'testsprite test failure get ${finalRun.testId}' to download the bundle.`
         : `Run finished with status: ${finalRun.status}. Use 'testsprite test artifact get ${finalRun.runId}' to download the failure bundle.`,
     );
@@ -5559,6 +5754,7 @@ export async function runTestWaitMany(
       const run = await pollRunUntilTerminal(client, runId, {
         timeoutSeconds: remainingSeconds,
         sleep: deps.sleep,
+        shutdown: shutdownOf(deps),
         onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
         onTick: (run, elapsedMs) => {
           const elapsed = Math.round(elapsedMs / 1000);
@@ -5570,6 +5766,10 @@ export async function runTestWaitMany(
     } catch (err) {
       if (err instanceof TimeoutError) return { kind: 'timeout' };
       if (err instanceof RequestTimeoutError) throw err;
+      // Interrupt must reject the fan-out (handled at the collect point), not
+      // be flattened into a per-member 'error' outcome that would swallow the
+      // 128+signum exit (DEV-331).
+      if (err instanceof InterruptError) throw err;
       if (err instanceof ApiError) return { kind: 'error', code: err.code, exitCode: err.exitCode };
       return { kind: 'error', code: 'TRANSPORT', exitCode: 10 };
     }
@@ -5599,12 +5799,16 @@ export async function runTestWaitMany(
       if (opts.runIds.length === 0) resolve();
     });
   } catch (fanOutErr) {
-    if (fanOutErr instanceof RequestTimeoutError) {
+    if (fanOutErr instanceof RequestTimeoutError || fanOutErr instanceof InterruptError) {
       // Same contract as the batch pollers: leave stdout parseable before
-      // exiting 7. Members that already settled keep their real status; only
+      // exiting. Members that already settled keep their real status; only
       // the still-unfinished ids are marked running and named in the hint
       // (re-attaching to an already-terminal run would be a wasted command).
-      ticker.finalize('Multi-run wait — request timed out');
+      ticker.finalize(
+        fanOutErr instanceof InterruptError
+          ? `Multi-run wait — interrupted (${fanOutErr.signal})`
+          : 'Multi-run wait — request timed out',
+      );
       const partial = {
         results: opts.runIds.map((runId): CliMultiWaitResult => {
           const outcome = outcomes.get(runId);
@@ -5620,7 +5824,13 @@ export async function runTestWaitMany(
         .filter(r => r.status === 'running' || r.status === 'timeout')
         .map(r => r.runId);
       if (unfinished.length > 0) {
-        stderrFn(`Re-attach with: testsprite test wait ${unfinished.join(' ')}`);
+        if (fanOutErr instanceof InterruptError) {
+          stderrFn(interruptDetachMessage(fanOutErr, unfinished));
+        } else {
+          stderrFn(
+            `Re-attach with: testsprite test wait ${unfinished.join(' ')}, or cancel with: testsprite test cancel ${unfinished.join(' ')}`,
+          );
+        }
       }
     }
     throw fanOutErr;
@@ -5656,7 +5866,9 @@ export async function runTestWaitMany(
     .filter(r => r.status === 'timeout' || r.status.startsWith('error:'))
     .map(r => r.runId);
   if (unfinishedIds.length > 0) {
-    stderrFn(`Re-attach with: testsprite test wait ${unfinishedIds.join(' ')}`);
+    stderrFn(
+      `Re-attach with: testsprite test wait ${unfinishedIds.join(' ')}, or cancel with: testsprite test cancel ${unfinishedIds.join(' ')}`,
+    );
   }
 
   // Worst-status exit: auth escalates (a rejected key fails every member the
@@ -5682,6 +5894,190 @@ export async function runTestWaitMany(
     throw new CLIError(`Multi-run wait: ${failed} run(s) finished non-passed`, 1);
   }
   return payload;
+}
+
+// ---------------------------------------------------------------------------
+// DEV-331 piece 3 — `test cancel <run-id...>`
+// ---------------------------------------------------------------------------
+
+export interface RunTestCancelOptions extends CommonOptions {
+  runIds: string[];
+}
+
+/** One run's outcome in a multi-id `test cancel` summary. */
+export interface CliCancelResultRow {
+  runId: string;
+  status: 'cancelled' | 'alreadyCancelled' | 'conflict' | 'notFound' | 'error';
+  /** Terminal status the run was already in, for a `conflict` row. */
+  conflictStatus?: string;
+  error?: string;
+}
+
+/** JSON payload for a multi-id `test cancel` — per piece-3 CXL-11. */
+export interface CliCancelSummary {
+  cancelled: string[];
+  alreadyCancelled: string[];
+  conflicts: Array<{ runId: string; status: string }>;
+  notFound: string[];
+  /**
+   * Runs that errored for a reason other than 404/409 (e.g. auth, transport).
+   * Always present — an empty array on full success — so machine consumers
+   * can rely on a stable shape (DEV-331 codex finding 2).
+   */
+  errors: Array<{ runId: string; message: string }>;
+}
+
+/**
+ * `test cancel <run-id...>` — DEV-331 piece 3.
+ *
+ * User-initiated cancel of one or more queued/running runs via
+ * `POST /api/cli/v1/runs/{runId}/cancel`. Naturally idempotent (D10): a
+ * repeat cancel of the same run is a 200 `alreadyCancelled` success, not an
+ * error. Dispatches serially (per-id volume is tiny — no batch endpoint,
+ * D8 "Batch-level cancel endpoint... YAGNI").
+ *
+ * Single id: renders the returned run card (`status cancelled`); an
+ * `alreadyCancelled` response adds an `[advisory]` line. Exit code mirrors
+ * the server response directly — 0 on success (fresh or already-cancelled),
+ * 4 on 404 (unknown/cross-tenant), 6 on 409 (already terminal).
+ *
+ * Multi-id: prints a `{cancelled, alreadyCancelled, conflicts, notFound}`
+ * summary. Exit precedence (CXL-11): any `notFound` → 4 (outranks conflict —
+ * it signals a caller bug, wrong id/tenant); else any `conflicts` → 6; else 0.
+ */
+export async function runTestCancel(
+  opts: RunTestCancelOptions,
+  deps: TestDeps = {},
+): Promise<CancelRunResponse | CliCancelSummary> {
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const out = makeOutput(opts.output, deps);
+  const client = makeClient(opts, deps);
+
+  if (opts.dryRun) {
+    emitDryRunBanner(stderrFn);
+  }
+
+  if (opts.runIds.length === 1) {
+    const runId = opts.runIds[0]!;
+    const result = await client.cancelRun(runId);
+    out.print(result, data => {
+      const r = data as CancelRunResponse;
+      return renderRunResponseText(r);
+    });
+    if (result.alreadyCancelled) {
+      stderrFn(`[advisory] run ${runId} was already cancelled`);
+    }
+    return result;
+  }
+
+  const rows: CliCancelResultRow[] = [];
+  for (const runId of opts.runIds) {
+    try {
+      const result = await client.cancelRun(runId);
+      rows.push({
+        runId,
+        status: result.alreadyCancelled ? 'alreadyCancelled' : 'cancelled',
+      });
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'NOT_FOUND') {
+        rows.push({ runId, status: 'notFound' });
+        continue;
+      }
+      if (err instanceof ApiError && err.code === 'CONFLICT') {
+        const conflictStatus =
+          err.getDetail<string>('status', (v): v is string => typeof v === 'string') ?? 'unknown';
+        rows.push({ runId, status: 'conflict', conflictStatus });
+        continue;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      rows.push({ runId, status: 'error', error: message });
+    }
+  }
+
+  const errorRows = rows.filter(r => r.status === 'error');
+  const summary: CliCancelSummary = {
+    cancelled: rows.filter(r => r.status === 'cancelled').map(r => r.runId),
+    alreadyCancelled: rows.filter(r => r.status === 'alreadyCancelled').map(r => r.runId),
+    conflicts: rows
+      .filter(r => r.status === 'conflict')
+      .map(r => ({ runId: r.runId, status: r.conflictStatus ?? 'unknown' })),
+    notFound: rows.filter(r => r.status === 'notFound').map(r => r.runId),
+    errors: errorRows.map(r => ({ runId: r.runId, message: r.error ?? 'unknown error' })),
+  };
+
+  out.print(summary, data => renderCancelSummaryText(data as CliCancelSummary));
+
+  const parts = [
+    `${summary.cancelled.length} cancelled`,
+    `${summary.alreadyCancelled.length} already cancelled`,
+  ];
+  if (summary.conflicts.length > 0) parts.push(`${summary.conflicts.length} conflict`);
+  if (summary.notFound.length > 0) parts.push(`${summary.notFound.length} not found`);
+  if (errorRows.length > 0) parts.push(`${errorRows.length} error`);
+  stderrFn(`Cancel summary: ${parts.join(', ')}.`);
+
+  // Exit precedence (CXL-11): notFound outranks conflict — a caller-side bug
+  // (wrong id / wrong tenant) is more actionable to surface than "it already
+  // finished". A bare transport/auth error on any member also fails loudly
+  // rather than being silently absorbed into a 0 exit.
+  if (summary.notFound.length > 0) {
+    throw new CLIError(
+      `${summary.notFound.length} run id${summary.notFound.length !== 1 ? 's' : ''} not found: ${summary.notFound.join(' ')}`,
+      4,
+    );
+  }
+  if (errorRows.length > 0) {
+    throw new CLIError(
+      `${errorRows.length} cancel request${errorRows.length !== 1 ? 's' : ''} failed: ${errorRows.map(r => r.runId).join(' ')}`,
+      1,
+    );
+  }
+  if (summary.conflicts.length > 0) {
+    throw new CLIError(
+      `${summary.conflicts.length} run${summary.conflicts.length !== 1 ? 's' : ''} already terminal: ${summary.conflicts.map(c => `${c.runId} (${c.status})`).join(', ')}`,
+      6,
+    );
+  }
+  return summary;
+}
+
+function renderCancelSummaryText(summary: CliCancelSummary): string {
+  const lines: string[] = [];
+  for (const runId of summary.cancelled) lines.push(`${runId}  cancelled`);
+  for (const runId of summary.alreadyCancelled) lines.push(`${runId}  alreadyCancelled`);
+  for (const c of summary.conflicts) lines.push(`${c.runId}  conflict (${c.status})`);
+  for (const runId of summary.notFound) lines.push(`${runId}  notFound`);
+  for (const e of summary.errors ?? []) lines.push(`${e.runId}  error (${e.message})`);
+  return lines.join('\n');
+}
+
+export function createTestCancelCommand(deps: TestDeps): Command {
+  const cancel = new Command('cancel');
+  cancel
+    .argument('<run-id...>', 'one or more run ids to cancel')
+    .description(
+      'Cancel one or more queued/running runs.\n' +
+        '\nCtrl-C during --wait only detaches — it does NOT cancel the server-side\n' +
+        'run. This is the real stop button. No refund is issued for the credits\n' +
+        'already charged at trigger time (D3); an in-flight Lambda finishes on its\n' +
+        'own and its result is discarded once cancelled.\n' +
+        '\nExit codes:\n' +
+        '  0  cancelled (fresh or already-cancelled — naturally idempotent)\n' +
+        '  4  run id not found (single id), or ANY id not found (multi-id — outranks conflict)\n' +
+        '  6  run already terminal (passed/failed/blocked) — single id: 409; multi-id: any conflict\n' +
+        '\nMulti-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound}.',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (runIds: string[], _cmdOpts: unknown, command: Command) => {
+      await runTestCancel(
+        {
+          ...resolveCommonOptions(command),
+          runIds,
+        },
+        deps,
+      );
+    });
+  return cancel;
 }
 
 /**
@@ -5744,6 +6140,7 @@ export async function runTestWait(
     finalRun = await pollRunUntilTerminal(client, opts.runId, {
       timeoutSeconds: opts.timeoutSeconds,
       sleep: deps.sleep,
+      shutdown: shutdownOf(deps),
       onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
       onTick: (run, elapsedMs) => {
         const elapsed = Math.round(elapsedMs / 1000);
@@ -5767,13 +6164,14 @@ export async function runTestWait(
           `runId       ${p.runId}`,
           `status      ${p.status} (timed out after ${opts.timeoutSeconds}s)`,
           `hint        Re-attach with: testsprite test wait ${p.runId}`,
+          `hint        Cancel with:    testsprite test cancel ${p.runId}`,
         ].join('\n');
       });
       throw ApiError.fromEnvelope({
         error: {
           code: 'UNSUPPORTED', // exit 7 per errors.md
           message: `Timed out after ${opts.timeoutSeconds}s waiting for run ${opts.runId}.`,
-          nextAction: `Resume polling: testsprite test wait ${opts.runId}`,
+          nextAction: `Resume polling: testsprite test wait ${opts.runId}, or cancel it: testsprite test cancel ${opts.runId}`,
           requestId: 'local',
           details: { runId: opts.runId, timeoutSeconds: opts.timeoutSeconds },
         },
@@ -5791,12 +6189,29 @@ export async function runTestWait(
           `runId       ${p.runId}`,
           `status      ${p.status} (request timed out)`,
           `hint        Re-attach with: testsprite test wait ${p.runId}`,
+          `hint        Cancel with:    testsprite test cancel ${p.runId}`,
         ].join('\n');
       });
       stderrFn(
         `Run ${opts.runId} is still in progress (request timed out). ` +
-          `Re-attach with: testsprite test wait ${opts.runId}`,
+          `Re-attach with: testsprite test wait ${opts.runId}, or cancel with: testsprite test cancel ${opts.runId}`,
       );
+      throw err;
+    }
+    // Graceful detach on SIGINT/SIGTERM (DEV-331 piece 1) — see runTestRun.
+    if (err instanceof InterruptError) {
+      ticker.finalize(`Run ${opts.runId} — interrupted (${err.signal})`);
+      const partial = { runId: opts.runId, status: 'running' as const };
+      out.print(partial, data => {
+        const p = data as typeof partial;
+        return [
+          `runId       ${p.runId}`,
+          `status      ${p.status} (interrupted)`,
+          `hint        Re-attach with: testsprite test wait ${p.runId}`,
+          `hint        Cancel with:    testsprite test cancel ${p.runId}`,
+        ].join('\n');
+      });
+      stderrFn(interruptDetachMessage(err, [opts.runId]));
       throw err;
     }
     ticker.finalize();
@@ -5809,15 +6224,24 @@ export async function runTestWait(
     `Run ${finalRun.runId} — ${finalRun.status} (${s.completed}/${s.total} steps elapsed=${elapsed}s)`,
   );
 
+  // `test wait` has no type hint; probe the test type once (text mode only,
+  // best-effort) so a backend run's card reads `n/a (backend)` — DEV-282.
+  const isBackend = await resolveRunCardIsBackend(
+    client,
+    finalRun.testId,
+    opts.output,
+    beFallbackUsed,
+  );
+
   out.print(withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)), data =>
-    renderRunResponseText(data as RunResponse, { isBackend: beFallbackUsed }),
+    renderRunResponseText(data as RunResponse, { isBackend }),
   );
 
   if (finalRun.status === 'failed' || finalRun.status === 'blocked') {
-    // BE runs (resolved via the testId fallback) have no run-scoped artifact
-    // bundle — their failure bundle is addressed by testId, not runId.
+    // BE runs have no run-scoped artifact bundle — their failure bundle is
+    // addressed by testId, not runId.
     stderrFn(
-      beFallbackUsed
+      isBackend
         ? `Run finished with status: ${finalRun.status}. Backend failure artifacts are addressed by testId — use 'testsprite test failure get ${finalRun.testId}' to download the bundle.`
         : `Run finished with status: ${finalRun.status}. Use 'testsprite test artifact get ${finalRun.runId}' to download the failure bundle.`,
     );
@@ -6276,6 +6700,7 @@ export async function runTestRunAll(
       const finalRun = await pollRunUntilTerminal(client, runId, {
         timeoutSeconds: remainingSeconds,
         sleep: deps.sleep,
+        shutdown: shutdownOf(deps),
         onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
         onTick: (run, elapsedMs) => {
           const elapsed = Math.round(elapsedMs / 1000);
@@ -6305,6 +6730,10 @@ export async function runTestRunAll(
           },
         };
       }
+      // Interrupt must reject the fan-out (the collect point below prints the
+      // partial for every dispatched run), never flatten into a per-member
+      // outcome that would swallow the 128+signum exit (DEV-331).
+      if (err instanceof InterruptError) throw err;
       if (err instanceof RequestTimeoutError) {
         // Client-side per-request timeout during polling — classify as timeout
         // (exit 7) so the fan-out completes and stdout carries every runId.
@@ -6340,24 +6769,45 @@ export async function runTestRunAll(
   let pollIdx = 0;
   let inFlight = 0;
 
-  await new Promise<void>((resolve, reject) => {
-    function startNext(): void {
-      while (inFlight < concurrencyLimit && pollIdx < pollable.length) {
-        const entry = pollable[pollIdx++]!;
-        inFlight++;
-        pollFreshAccepted(entry)
-          .then(result => {
-            freshRunResults.push(result);
-            inFlight--;
-            startNext();
-            if (inFlight === 0 && pollIdx >= pollable.length) resolve();
-          })
-          .catch(reject);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      function startNext(): void {
+        while (inFlight < concurrencyLimit && pollIdx < pollable.length) {
+          const entry = pollable[pollIdx++]!;
+          inFlight++;
+          pollFreshAccepted(entry)
+            .then(result => {
+              freshRunResults.push(result);
+              inFlight--;
+              startNext();
+              if (inFlight === 0 && pollIdx >= pollable.length) resolve();
+            })
+            .catch(reject);
+        }
       }
+      startNext();
+      if (pollable.length === 0) resolve();
+    });
+  } catch (fanOutErr) {
+    // Graceful detach (DEV-331): stdout stays parseable — settled members
+    // keep their real status, unfinished ones are marked running — and the
+    // honest stderr line names every runId still executing (and billing).
+    if (fanOutErr instanceof InterruptError) {
+      ticker.finalize(`Batch run — interrupted (${fanOutErr.signal})`);
+      const settled = new Map(freshRunResults.map(r => [r.runId, r] as const));
+      const partialResults = pollable.map(
+        (e): CliBatchRunFreshResult =>
+          settled.get(e.runId) ?? { testId: e.testId, runId: e.runId, status: 'running' },
+      );
+      out.print(
+        { accepted: partialResults, conflicts, deferred, skippedFrontend, skippedIntegration },
+        () => partialResults.map(r => `${r.runId}  ${r.status}`).join('\n'),
+      );
+      const unfinished = pollable.filter(e => !settled.has(e.runId)).map(e => e.runId);
+      if (unfinished.length > 0) stderrFn(interruptDetachMessage(fanOutErr, unfinished));
     }
-    startNext();
-    if (pollable.length === 0) resolve();
-  });
+    throw fanOutErr;
+  }
 
   ticker.finalize();
 
@@ -6411,7 +6861,10 @@ export async function runTestRunAll(
       error: {
         code: 'UNSUPPORTED',
         message: `${timedOut} run${timedOut !== 1 ? 's' : ''} timed out.`,
-        nextAction: timedOutRunIds.map(rid => `Resume: testsprite test wait ${rid}`).join('\n'),
+        nextAction: [
+          ...timedOutRunIds.map(rid => `Resume: testsprite test wait ${rid}`),
+          ...timedOutRunIds.map(rid => `Cancel: testsprite test cancel ${rid}`),
+        ].join('\n'),
         requestId: 'local',
         details: { timedOutRunIds, timeoutSeconds: opts.timeoutSeconds },
       },
@@ -6799,6 +7252,7 @@ export async function runTestRerun(
           return await pollRunUntilTerminal(client, member.runId, {
             timeoutSeconds: opts.timeoutSeconds,
             sleep: deps.sleep,
+            shutdown: shutdownOf(deps),
             onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
             onTick: (run, elapsedMs) => {
               const elapsed = Math.round(elapsedMs / 1000);
@@ -6894,8 +7348,35 @@ export async function runTestRerun(
           const reattachHints = closureMembers
             .map(m => `testsprite test wait ${m.runId}`)
             .join('\n');
+          const cancelHints = closureMembers
+            .map(m => `testsprite test cancel ${m.runId}`)
+            .join('\n');
           stderrFn(
-            `Closure members are still in progress (request timed out). Re-attach with:\n${reattachHints}`,
+            `Closure members are still in progress (request timed out). Re-attach with:\n${reattachHints}\n` +
+              `Or cancel with:\n${cancelHints}`,
+          );
+          throw fanOutErr;
+        }
+        // Graceful detach (DEV-331): same partial shape as the timeout path —
+        // SIG-6 requires the partial to list ALL dispatched runIds.
+        if (fanOutErr instanceof InterruptError) {
+          ticker.finalize(`Closure fan-out — interrupted (${fanOutErr.signal})`);
+          const dispatchedRunIds = closureMembers.map(m => ({
+            runId: m.runId,
+            testId: m.testId,
+            role: m.role,
+            status: 'running' as const,
+          }));
+          out.print({ runId: namedRunId, status: 'running', closure: dispatchedRunIds }, () =>
+            dispatchedRunIds
+              .map(m => `${m.role.padEnd(9)} ${m.testId} (runId: ${m.runId}) — running`)
+              .join('\n'),
+          );
+          stderrFn(
+            interruptDetachMessage(
+              fanOutErr,
+              closureMembers.map(m => m.runId),
+            ),
           );
           throw fanOutErr;
         }
@@ -6937,7 +7418,7 @@ export async function runTestRerun(
           error: {
             code: 'UNSUPPORTED',
             message: `Timed out after ${opts.timeoutSeconds}s waiting for rerun ${namedRunId}.`,
-            nextAction: `Resume polling: testsprite test wait ${namedRunId}`,
+            nextAction: `Resume polling: testsprite test wait ${namedRunId}, or cancel it: testsprite test cancel ${namedRunId}`,
             requestId: 'local',
             details: { runId: namedRunId, timeoutSeconds: opts.timeoutSeconds },
           },
@@ -6957,7 +7438,10 @@ export async function runTestRerun(
       // as a whole was never observed to reach terminal.
       const timedOutMembers = closureFailures.filter(f => f.status === 'timeout');
       if (timedOutMembers.length > 0) {
-        const resumeHints = timedOutMembers.map(f => `testsprite test wait ${f.runId}`).join('\n');
+        const timedOutIds = timedOutMembers.map(f => f.runId);
+        const resumeHints =
+          timedOutIds.map(runId => `testsprite test wait ${runId}`).join('\n') +
+          `\nCancel instead: testsprite test cancel ${timedOutIds.join(' ')}`;
         throw ApiError.fromEnvelope({
           error: {
             code: 'UNSUPPORTED',
@@ -6995,6 +7479,7 @@ export async function runTestRerun(
       finalRun = await pollRunUntilTerminal(client, rerunResp.runId, {
         timeoutSeconds: opts.timeoutSeconds,
         sleep: deps.sleep,
+        shutdown: shutdownOf(deps),
         onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
         onTick: (run, elapsedMs) => {
           const elapsed = Math.round(elapsedMs / 1000);
@@ -7012,7 +7497,7 @@ export async function runTestRerun(
           error: {
             code: 'UNSUPPORTED',
             message: `Timed out after ${opts.timeoutSeconds}s waiting for rerun ${rerunResp.runId}.`,
-            nextAction: `Resume polling: testsprite test wait ${rerunResp.runId}`,
+            nextAction: `Resume polling: testsprite test wait ${rerunResp.runId}, or cancel it: testsprite test cancel ${rerunResp.runId}`,
             requestId: 'local',
             details: { runId: rerunResp.runId, timeoutSeconds: opts.timeoutSeconds },
           },
@@ -7029,12 +7514,29 @@ export async function runTestRerun(
             `runId       ${p.runId}`,
             `status      ${p.status} (request timed out)`,
             `hint        Re-attach with: testsprite test wait ${p.runId}`,
+            `hint        Cancel with:    testsprite test cancel ${p.runId}`,
           ].join('\n');
         });
         stderrFn(
           `Run ${rerunResp.runId} is still in progress (request timed out). ` +
-            `Re-attach with: testsprite test wait ${rerunResp.runId}`,
+            `Re-attach with: testsprite test wait ${rerunResp.runId}, or cancel with: testsprite test cancel ${rerunResp.runId}`,
         );
+        throw err;
+      }
+      // Graceful detach on SIGINT/SIGTERM (DEV-331 piece 1) — see runTestRun.
+      if (err instanceof InterruptError) {
+        ticker.finalize(`Run ${rerunResp.runId} — interrupted (${err.signal})`);
+        const partial = { runId: rerunResp.runId, status: 'running' as const };
+        out.print(partial, data => {
+          const p = data as typeof partial;
+          return [
+            `runId       ${p.runId}`,
+            `status      ${p.status} (interrupted)`,
+            `hint        Re-attach with: testsprite test wait ${p.runId}`,
+            `hint        Cancel with:    testsprite test cancel ${p.runId}`,
+          ].join('\n');
+        });
+        stderrFn(interruptDetachMessage(err, [rerunResp.runId]));
         throw err;
       }
       ticker.finalize();
@@ -7048,13 +7550,21 @@ export async function runTestRerun(
       `Run ${finalRun.runId} — ${finalRun.status} (${s.completed}/${s.total} steps replay)`,
     );
 
+    // Probe the test type once (text mode only, best-effort) so a backend
+    // rerun's card reads `n/a (backend)` even when the fallback never fired
+    // (BE run rows finalize server-side now) — DEV-282.
+    const isBackend = await resolveRunCardIsBackend(client, testId, opts.output, beFallbackUsed);
+
     out.print(withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)), data =>
-      renderRunResponseText(data as RunResponse, { isBackend: beFallbackUsed }),
+      renderRunResponseText(data as RunResponse, { isBackend }),
     );
 
     if (finalRun.status === 'failed' || finalRun.status === 'blocked') {
+      // BE reruns have no run-scoped artifact bundle — address by testId.
       stderrFn(
-        `Run finished with status: ${finalRun.status}. Use 'testsprite test artifact get ${finalRun.runId}' to download the failure bundle.`,
+        isBackend
+          ? `Run finished with status: ${finalRun.status}. Backend failure artifacts are addressed by testId — use 'testsprite test failure get ${testId}' to download the bundle.`
+          : `Run finished with status: ${finalRun.status}. Use 'testsprite test artifact get ${finalRun.runId}' to download the failure bundle.`,
       );
     }
 
@@ -7501,6 +8011,7 @@ export async function runTestRerun(
       const finalRun = await pollRunUntilTerminal(client, entry.runId, {
         timeoutSeconds: remainingSeconds,
         sleep: deps.sleep,
+        shutdown: shutdownOf(deps),
         onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
         onTick: (run, elapsedMs) => {
           const elapsed = Math.round(elapsedMs / 1000);
@@ -7530,6 +8041,10 @@ export async function runTestRerun(
           },
         };
       }
+      // Interrupt must reject the fan-out (the collect point below prints the
+      // partial for every dispatched run), never flatten into a per-member
+      // outcome that would swallow the 128+signum exit (DEV-331).
+      if (err instanceof InterruptError) throw err;
       if (err instanceof RequestTimeoutError) {
         // Client-side per-request timeout during polling — classify as timeout
         // (exit 7) so the fan-out completes and stdout carries every runId.
@@ -7565,24 +8080,44 @@ export async function runTestRerun(
   let acceptedIdx = 0;
   let inFlight = 0;
 
-  await new Promise<void>((resolve, reject) => {
-    function startNext(): void {
-      while (inFlight < concurrencyLimit && acceptedIdx < accepted.length) {
-        const entry = accepted[acceptedIdx++]!;
-        inFlight++;
-        pollAccepted(entry)
-          .then(result => {
-            rerunResults.push(result);
-            inFlight--;
-            startNext();
-            if (inFlight === 0 && acceptedIdx >= accepted.length) resolve();
-          })
-          .catch(reject);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      function startNext(): void {
+        while (inFlight < concurrencyLimit && acceptedIdx < accepted.length) {
+          const entry = accepted[acceptedIdx++]!;
+          inFlight++;
+          pollAccepted(entry)
+            .then(result => {
+              rerunResults.push(result);
+              inFlight--;
+              startNext();
+              if (inFlight === 0 && acceptedIdx >= accepted.length) resolve();
+            })
+            .catch(reject);
+        }
       }
+      startNext();
+      if (accepted.length === 0) resolve();
+    });
+  } catch (fanOutErr) {
+    // Graceful detach (DEV-331): stdout stays parseable — settled members
+    // keep their real status, unfinished ones are marked running — and the
+    // honest stderr line names every runId still executing (and billing).
+    if (fanOutErr instanceof InterruptError) {
+      ticker.finalize(`Batch rerun — interrupted (${fanOutErr.signal})`);
+      const settled = new Map(rerunResults.map(r => [r.runId, r] as const));
+      const partialResults = accepted.map(
+        (e): CliRerunResult =>
+          settled.get(e.runId) ?? { testId: e.testId, runId: e.runId, status: 'running' },
+      );
+      out.print({ accepted: partialResults, deferred, conflicts, notFound }, () =>
+        partialResults.map(r => `${r.runId}  ${r.status}`).join('\n'),
+      );
+      const unfinished = accepted.filter(e => !settled.has(e.runId)).map(e => e.runId);
+      if (unfinished.length > 0) stderrFn(interruptDetachMessage(fanOutErr, unfinished));
     }
-    startNext();
-    if (accepted.length === 0) resolve();
-  });
+    throw fanOutErr;
+  }
 
   ticker.finalize();
 
@@ -7646,6 +8181,7 @@ export async function runTestRerun(
           // `test wait` accepts exactly one run id — emit one command per
           // timed-out run so the hint is always valid.
           ...(timedOut > 0 ? stillRunning.map(rid => `Resume: testsprite test wait ${rid}`) : []),
+          ...(timedOut > 0 ? stillRunning.map(rid => `Cancel: testsprite test cancel ${rid}`) : []),
         ]
           .filter(Boolean)
           .join('\n'),
@@ -8313,6 +8849,22 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .option('--description <text>', 'new human description (≤ 2000 chars)')
     .option('--priority <prio>', 'new priority — one of: p0, p1, p2, p3')
     .option(
+      '--produces <var>',
+      'BE only: variable name this test captures (repeatable). Drives dependency-aware wave ordering.',
+      (val: string, prev: string[]) => [...(prev ?? []), val],
+      [] as string[],
+    )
+    .option(
+      '--needs <var>',
+      'BE only: variable name this test consumes (repeatable). Declares an upstream producer dependency.',
+      (val: string, prev: string[]) => [...(prev ?? []), val],
+      [] as string[],
+    )
+    .option(
+      '--category <str>',
+      "BE only: test category. Use 'teardown' or 'cleanup' to mark a final-wave cleanup test.",
+    )
+    .option(
       '--idempotency-key <token>',
       'opaque idempotency token (1-256 ASCII chars). Defaults to a UUIDv4 minted per invocation; pin one yourself for safe retries.',
     )
@@ -8327,6 +8879,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           priority: parseEnumFlag(cmdOpts.priority, 'priority', CLI_CREATE_PRIORITIES) as
             | CliCreatePriority
             | undefined,
+          produces: cmdOpts.produces,
+          needs: cmdOpts.needs,
+          category: cmdOpts.category,
           idempotencyKey: cmdOpts.idempotencyKey,
         },
         deps,
@@ -8411,10 +8966,13 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '  4  test not found\n' +
         '  5  validation error (e.g., bad --target-url, or positional + --all both set)\n' +
         '  6  conflict (already running — see nextAction for the active runId)\n' +
-        '  7  timeout — resume with: testsprite test wait <run-id>\n' +
+        '  7  timeout — resume with: testsprite test wait <run-id>, ' +
+        'or stop it with: testsprite test cancel <run-id>\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         ' 11  rate limited — honor Retry-After\n' +
-        '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>',
+        '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>\n' +
+        '\nCtrl-C during --wait detaches only (the run keeps executing and billing);\n' +
+        'stop it for real with: testsprite test cancel <run-id>',
     )
     .option(
       '--target-url <url>',
@@ -8574,7 +9132,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '     is recorded as error:<CODE> in its row and folded into exit 7)\n' +
         '  7  timeout or per-member poll error — resume with: testsprite test wait <run-id...>\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
-        '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>',
+        '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>\n' +
+        '\nCtrl-C detaches only (the run keeps executing and billing); stop it for\n' +
+        'real with: testsprite test cancel <run-id...>',
     )
     .option('--timeout <s>', `max seconds to wait (1–3600, default ${DEFAULT_RUN_TIMEOUT_SECONDS})`)
     .option(
@@ -8626,9 +9186,12 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '  4  test not found\n' +
         '  5  validation error\n' +
         '  6  conflict (already running — see nextAction for the active runId)\n' +
-        '  7  timeout or deferred — resume with: testsprite test wait <run-id>\n' +
+        '  7  timeout or deferred — resume with: testsprite test wait <run-id>, ' +
+        'or stop it with: testsprite test cancel <run-id>\n' +
         ' 11  rate limited — honor Retry-After\n' +
-        '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>',
+        '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>\n' +
+        '\nCtrl-C during --wait detaches only (the run keeps executing and billing);\n' +
+        'stop it for real with: testsprite test cancel <run-id>',
     )
     .option('--all', 'rerun all tests in the resolved project (requires --project)', false)
     .option(
@@ -8802,6 +9365,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
   test.addCommand(createTestPlanCommand(deps));
   test.addCommand(createTestFailureCommand(deps));
   test.addCommand(createTestArtifactCommand(deps));
+  test.addCommand(createTestCancelCommand(deps));
 
   return test;
 }
@@ -8937,12 +9501,20 @@ export async function runFlaky(
       const finalRun = await pollRunUntilTerminal(client, runId, {
         timeoutSeconds: opts.timeoutSeconds,
         sleep: deps.sleep,
+        shutdown: shutdownOf(deps),
         onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
         resolveAlternate,
       });
       outcome = finalRun.status as FlakyOutcome;
       failureKind = finalRun.failureKind;
     } catch (err) {
+      // Graceful detach (DEV-331): clean up the ticker line, name the run
+      // still executing server-side, and let index.ts exit 128+signum.
+      if (err instanceof InterruptError) {
+        ticker.finalize(`Attempt ${i}/${opts.runs} — interrupted (${err.signal})`);
+        stderrFn(interruptDetachMessage(err, [runId]));
+        throw err;
+      }
       // A per-attempt deadline (poll TimeoutError) or a client-side request
       // timeout both count as a non-passing "timeout" outcome for this attempt.
       if (err instanceof TimeoutError || err instanceof RequestTimeoutError) {
@@ -9015,6 +9587,9 @@ interface UpdateFlagOpts {
   name?: string;
   description?: string;
   priority?: string;
+  produces?: string[];
+  needs?: string[];
+  category?: string;
   idempotencyKey?: string;
 }
 
@@ -9199,6 +9774,7 @@ function makeClient(opts: CommonOptions, deps: TestDeps): HttpClient {
     credentialsPath: deps.credentialsPath,
     fetchImpl: deps.fetchImpl,
     stderr: deps.stderr,
+    shutdownSignal: shutdownOf(deps).signal,
   });
 }
 
@@ -9506,6 +10082,16 @@ function renderTestText(t: CliTest): string {
   if (typeof t.planStepCount === 'number') {
     lines.push(`planSteps:   ${t.planStepCount}`);
   }
+  // Surface backend dependency declarations when present.
+  if (Array.isArray(t.produces) && t.produces.length > 0) {
+    lines.push(`produces:    ${t.produces.join(', ')}`);
+  }
+  if (Array.isArray(t.consumes) && t.consumes.length > 0) {
+    lines.push(`consumes:    ${t.consumes.join(', ')}`);
+  }
+  if (t.category) {
+    lines.push(`category:    ${t.category}`);
+  }
   lines.push(`createdAt:   ${t.createdAt}`, `updatedAt:   ${t.updatedAt}`);
   return lines.join('\n');
 }
@@ -9639,6 +10225,14 @@ function renderFailureContextText(ctx: CliFailureContext): string {
     lines.push(`evidence:         ${ctx.failure.evidence.length} items (${breakdown})`);
   }
   if (ctx.result.videoUrl !== null) lines.push(`videoUrl:         ${ctx.result.videoUrl}`);
+  // backend stdout + traceback (prefer the failure block, falling
+  // back to the embedded result; identical values). Bounded tail; full content
+  // in --output json / the written failure.json.
+  appendBackendArtifactLines(
+    lines,
+    ctx.failure.apiOutput ?? ctx.result.apiOutput,
+    ctx.failure.trace ?? ctx.result.trace,
+  );
   return lines.join('\n');
 }
 
@@ -9760,6 +10354,9 @@ function renderResultText(r: CliLatestResult): string {
   lines.push(`summary:            ${r.summary}`);
   if (r.videoUrl !== null) lines.push(`videoUrl:           ${r.videoUrl}`);
   if (r.failureAnalysisUrl !== null) lines.push(`failureAnalysisUrl: ${r.failureAnalysisUrl}`);
+  // backend stdout + traceback (null/absent for FE, passed, and
+  // older backends). Full content always available via `--output json`.
+  appendBackendArtifactLines(lines, r.apiOutput, r.trace);
   if (r.analysis !== undefined) {
     // §6.5.1 (M2.1 piece 3) — render the inline analysis block under
     // the result summary. Only fires when the caller passed
@@ -9783,6 +10380,44 @@ function renderResultText(r: CliLatestResult): string {
  * level null. Non-null wrappers render `kind=...` plus an optional
  * reference and indented rationale.
  */
+/**
+ * Render backend-test stdout + traceback in text mode. Shared by
+ * `renderResultText` and `renderFailureContextText`. Both are bounded to a
+ * tail (last {@link BACKEND_ARTIFACT_TAIL_LINES} lines) so a large stdout can't
+ * flood the terminal; the full, untruncated content is always in the
+ * `--output json` envelope. No-op when both are null/absent (FE / passed /
+ * older backends), so non-backend output stays byte-identical.
+ */
+const BACKEND_ARTIFACT_TAIL_LINES = 20;
+
+function appendArtifactTail(
+  lines: string[],
+  label: string,
+  value: string | null | undefined,
+): void {
+  if (value == null || value === '') return;
+  const allLines = value.replace(/\n+$/, '').split('\n');
+  const dropped = Math.max(0, allLines.length - BACKEND_ARTIFACT_TAIL_LINES);
+  const tail = dropped > 0 ? allLines.slice(-BACKEND_ARTIFACT_TAIL_LINES) : allLines;
+  const bytes = Buffer.byteLength(value, 'utf8');
+  lines.push('');
+  lines.push(
+    `${label} (${bytes} bytes${dropped > 0 ? `, showing last ${tail.length} lines` : ''}):`,
+  );
+  for (const l of tail) lines.push(`  ${l}`);
+  if (dropped > 0)
+    lines.push(`  … ${dropped} earlier line(s) omitted — full content in --output json`);
+}
+
+function appendBackendArtifactLines(
+  lines: string[],
+  apiOutput: string | null | undefined,
+  trace: string | null | undefined,
+): void {
+  appendArtifactTail(lines, 'stdout', apiOutput);
+  appendArtifactTail(lines, 'trace', trace);
+}
+
 function appendFixTargetLines(lines: string[], fix: CliFixTarget | null, label: string): void {
   if (fix === null) {
     lines.push(`${label}— (analysis pipeline did not propose one)`);

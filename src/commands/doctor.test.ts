@@ -78,6 +78,51 @@ describe('runDoctor — healthy environment', () => {
     expect(out).toContain('reached GET /me');
   });
 
+  it('adds a Routing check (v3) and the gap advisory when /me reports v3Enabled', async () => {
+    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...healthyDeps(credentialsPath, {
+          fetchImpl: makeFetch({ ...OK_ME, v3Enabled: true }),
+        }),
+        ...deps,
+      },
+    );
+    expect(report.failures).toBe(0);
+    expect(report.checks.some(c => c.name === 'Routing' && c.detail.includes('v3'))).toBe(true);
+    expect(capture.stderr.join('\n')).toContain('[advisory]');
+    expect(capture.stderr.join('\n')).toContain('test cancel');
+  });
+
+  it('shows Routing v2 and no advisory when v3Enabled is false', async () => {
+    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...healthyDeps(credentialsPath, {
+          fetchImpl: makeFetch({ ...OK_ME, v3Enabled: false }),
+        }),
+        ...deps,
+      },
+    );
+    expect(report.checks.some(c => c.name === 'Routing' && c.detail.includes('v2'))).toBe(true);
+    expect(capture.stderr.join('\n')).not.toContain('[advisory]');
+  });
+
+  it('omits the Routing check when /me does not report v3Enabled', async () => {
+    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    const { deps } = makeCapture();
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      { ...healthyDeps(credentialsPath), ...deps }, // OK_ME has no v3Enabled
+    );
+    expect(report.checks.some(c => c.name === 'Routing')).toBe(false);
+    expect(report.warnings).toBe(0);
+  });
+
   it('never prints the API key anywhere in the report', async () => {
     writeProfile('default', { apiKey: 'sk-super-secret-value' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();

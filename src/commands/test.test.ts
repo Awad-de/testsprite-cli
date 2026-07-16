@@ -120,6 +120,7 @@ describe('createTestCommand — surface', () => {
     const names = test.commands.map(c => c.name()).sort();
     expect(names).toEqual([
       'artifact',
+      'cancel',
       'code',
       'create',
       'create-batch',
@@ -832,6 +833,40 @@ describe('runGet', () => {
       { credentialsPath, fetchImpl, stdout: line => out.push(line) },
     );
     expect(out.join('\n')).not.toContain('planSteps:');
+  });
+
+  it('renders produces/consumes/category when the facade ships them', async () => {
+    const withDeps: CliTest = {
+      ...FE_TEST,
+      produces: ['user_id', 'order_id'],
+      consumes: ['session_token'],
+      category: 'teardown',
+    };
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: withDeps }));
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    const block = out.join('\n');
+    expect(block).toContain('produces:    user_id, order_id');
+    expect(block).toContain('consumes:    session_token');
+    expect(block).toContain('category:    teardown');
+  });
+
+  it('omits produces/consumes/category lines when absent', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: FE_TEST }));
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    const block = out.join('\n');
+    expect(block).not.toContain('produces:');
+    expect(block).not.toContain('consumes:');
+    expect(block).not.toContain('category:');
   });
 
   it('NOT_FOUND envelope from server propagates as ApiError exit 4', async () => {
@@ -6273,6 +6308,74 @@ describe('runUpdate', () => {
       { credentialsPath, fetchImpl, stdout: () => undefined },
     );
     expect(seenBody).toEqual({ priority: 'p2' });
+  });
+
+  it('threads --produces/--needs/--category into the PUT body with wire names', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: SAMPLE_RESPONSE };
+    });
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        produces: ['user_id', 'order_id'],
+        needs: ['session_token'],
+        category: 'teardown',
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(seenBody).toEqual({
+      produces: ['user_id', 'order_id'],
+      consumes: ['session_token'],
+      category: 'teardown',
+    });
+  });
+
+  it('accepts a dependency-only update (not rejected as a no-op)', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: SAMPLE_RESPONSE };
+    });
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        category: 'teardown',
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(seenBody).toEqual({ category: 'teardown' });
+  });
+
+  it('omits empty dependency arrays from the body', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: SAMPLE_RESPONSE };
+    });
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        name: 'renamed',
+        produces: [],
+        needs: [],
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(seenBody).toEqual({ name: 'renamed' });
   });
 
   it('respects a caller-supplied --idempotency-key', async () => {

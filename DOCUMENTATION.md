@@ -180,7 +180,7 @@ Common flags:
 
 #### `testsprite test get <test-id>`
 
-Get a single test by id. Test ids look like `test_xxxxxxxx` and come from `test list`.
+Get a single test by id. Test ids look like `test_xxxxxxxx` and come from `test list`. Backend tests echo their dependency declarations — `produces` / `consumes` / `category` — when present.
 
 ```bash
 testsprite test get test_xxxxxxxx --output json
@@ -210,7 +210,7 @@ Common flags: `--page-size`, `--starting-token`, `--max-items` — same shape as
 
 #### `testsprite test result <test-id>`
 
-Get the latest result for a test — status, started / finished timestamps, video and failure-analysis URLs, summary counts (`passed / failed / skipped`), and correlation fields (`snapshotId`, `runId`, `codeVersion`). With `--include-analysis`, the response also carries an inline `analysis` block (root-cause hypothesis, recommended fix target, failure kind).
+Get the latest result for a test — status, started / finished timestamps, video and failure-analysis URLs, summary counts (`passed / failed / skipped`), and correlation fields (`snapshotId`, `runId`, `codeVersion`). With `--include-analysis`, the response also carries an inline `analysis` block (root-cause hypothesis, recommended fix target, failure kind). Backend tests additionally surface the run's captured stdout (`apiOutput`) and Python traceback (`trace`): full content under `--output json` (and in `result.json` / `failure.json` inside failure bundles); text mode prints a bounded 20-line tail of each with a byte count.
 
 ```bash
 testsprite test result test_xxxxxxxx --output json
@@ -293,7 +293,7 @@ testsprite test lint --steps ./refined.plan.json       # the shape `test plan pu
 
 #### `testsprite test create`
 
-Create a new test. Backend tests use `--code-file` (agents supply backend code directly); frontend tests use either `--code-file` or `--plan-from`. With `--run --wait`, the CLI chains create → trigger → poll in a single invocation.
+Create a new test. Backend tests use `--code-file` (agents supply backend code directly); frontend tests use either `--code-file` or `--plan-from`. With `--run --wait`, the CLI chains create → trigger → poll in a single invocation. Backend tests can declare wave-ordering dependencies at create time — `--produces <var>` / `--needs <var>` (repeatable) and `--category <setup|main|teardown>` — and amend them later via `test update`.
 
 ```bash
 # Backend test from a code file
@@ -319,10 +319,11 @@ testsprite test create-batch --plan-from-dir ./plans/ --dry-run --output json
 
 #### `testsprite test update <test-id>`
 
-Update test metadata (name, description).
+Update test metadata (name, description, priority) — and, for **backend tests**, the dependency declarations: `--produces <var>` / `--needs <var>` (repeatable) and `--category <setup|main|teardown>`. Updated declarations are echoed back by `test get`.
 
 ```bash
 testsprite test update test_xxxxxxxx --name "Renamed test" --description "Updated"
+testsprite test update test_be_xxxx --produces session_token --category setup
 testsprite test update test_xxxxxxxx --dry-run --output json
 ```
 
@@ -358,11 +359,20 @@ testsprite test plan put test_xxxxxxxx --steps ./refined.plan.json --dry-run --o
 
 #### `testsprite project create` / `project update`
 
-Manage projects from the CLI. Both pre-flight `--url` against local addresses for fast feedback. Note the asymmetry: `--description` is **create-only** — `project update` accepts `--name`, `--url`, `--username`, `--password`, `--password-file`, and `--instruction`, but not `--description`.
+Manage projects from the CLI. Both pre-flight `--url` against local addresses for fast feedback. Projects have **no description field** — `--description` is rejected client-side with a validation error (descriptions live on tests: `test create --description`). `project update` accepts `--name`, `--url`, `--username`, `--password`, `--password-file`, and `--instruction`.
 
 ```bash
 testsprite project create --type frontend --name "Checkout" --url https://staging.example.com
 testsprite project update proj_xxxxxxxx --name "Checkout v2"
+```
+
+#### `testsprite project delete <project-id>`
+
+Permanently delete a project and **everything under it** — its frontend/backend sub-projects, all their tests, and backend fixtures (mirrors the Portal's cascade delete). There is **no restore window**. `--confirm` is required (the CLI never prompts); absent it, the CLI exits 5 with a local validation error. `--dry-run` previews the response shape without a network call. Exit codes: 0 success, 3 auth, 4 not found (or already deleted), 5 validation.
+
+```bash
+testsprite project delete proj_xxxxxxxx --confirm
+testsprite project delete proj_xxxxxxxx --dry-run --output json
 ```
 
 #### `testsprite project credential <project-id>`
@@ -521,6 +531,16 @@ testsprite test wait run_01hx3z9p8q4k2y7a --dry-run --output json
 
 With several ids, a per-member poll error (e.g. one id not found) is recorded as `error:<CODE>` in that run's row and folded into exit 7, rather than aborting the whole batch. Polling is handled automatically — the CLI uses server-driven long-poll where supported and exponential backoff with jitter otherwise, honoring `Retry-After`.
 
+#### `testsprite test cancel <run-id...>`
+
+Cancel one or more in-flight runs — the counterpart to Ctrl-C, which only **detaches** (the server-side run keeps executing and billing). Cancelling is idempotent: an already-cancelled run reports `alreadyCancelled` as an advisory, not an error; a run that already reached a terminal verdict is a conflict — the verdict is never overwritten, and no credits are refunded. With one id, prints the run card; with several, prints a `{ cancelled, alreadyCancelled, conflicts, notFound }` summary. Exit codes: any unknown id → 4; else any conflict → 6; else 0.
+
+```bash
+testsprite test cancel run_01hx3z9p8q4k2y7a
+testsprite test cancel run_aaaa run_bbbb --output json
+testsprite test cancel run_01hx3z9p8q4k2y7a --dry-run --output json
+```
+
 #### `testsprite test artifact get <run-id>`
 
 Download the failure bundle for a specific `runId`. Same on-disk layout as `test failure get`, but addressed by `runId` instead of `testId`, so an agent can fetch the bundle for the exact run it just triggered — never a newer failure on the same test. Default `<dir>` is `./.testsprite/runs/<run-id>/`. The CLI enforces `meta.runId === <run-id>` as an integrity check; a mismatch exits 5 rather than silently writing the wrong bundle.
@@ -603,6 +623,13 @@ check is skipped in CI, when stderr is not a TTY, under `--output json` /
 failure is silent: the notice can never break or delay a command. This is the
 only outbound call the CLI makes besides your configured API endpoint.
 
+Separately, the backend advertises its **minimum supported CLI version** on
+every `/api/cli/v1` response. When the running CLI is below that floor, a
+one-line upgrade advisory is printed to stderr (same opt-outs as the update
+notice; it never changes the exit status). A backend may also reject a
+too-old client outright with HTTP 426 — surfaced as `CLIENT_TOO_OLD`,
+exit `14`, non-retriable, with upgrade guidance.
+
 ### Scopes
 
 API-key scopes gate the write and run surfaces:
@@ -613,8 +640,8 @@ API-key scopes gate the write and run surfaces:
 | `read:projects`  | `project list / get`                                                 |
 | `read:tests`     | every `test *` read command                                          |
 | `write:tests`    | `test create / create-batch / update / delete / code put / plan put` |
-| `write:projects` | `project create / update / credential / auto-auth`                   |
-| `run:tests`      | `test run / rerun / flaky / wait / artifact get`                     |
+| `write:projects` | `project create / update / delete / credential / auto-auth`          |
+| `run:tests`      | `test run / rerun / flaky / wait / cancel / artifact get`            |
 
 New API keys include the full scope set. If a command returns `AUTH_FORBIDDEN`, the missing scope is named in `details.requiredScope` — regenerate your key from the dashboard to pick up new scopes.
 
@@ -632,25 +659,26 @@ testsprite test wait "$RUN_ID" --timeout 600 --output json || echo "run did not 
 
 ## Exit codes
 
-| Code                  | Meaning                                                                     |
-| --------------------- | --------------------------------------------------------------------------- |
-| `0`                   | Success                                                                     |
-| `1`                   | Generic failure / non-passed run status                                     |
-| `2`                   | Not yet implemented                                                         |
-| `3`                   | Auth error                                                                  |
-| `4`                   | Not found                                                                   |
-| `5`                   | Validation error / payload too large                                        |
-| `6`                   | Conflict / precondition failed                                              |
-| `7`                   | Timeout / unsupported                                                       |
-| `10`                  | Service unavailable                                                         |
-| `11`                  | Rate limited (retriable)                                                    |
-| `12`                  | Insufficient credits (non-retriable)                                        |
-| `13`                  | Feature gated (paid plan required)                                          |
-| `129` / `130` / `143` | Interrupted by a signal (SIGHUP / SIGINT / SIGTERM) — `128 + signal number` |
+| Code                  | Meaning                                                                                           |
+| --------------------- | ------------------------------------------------------------------------------------------------- |
+| `0`                   | Success                                                                                           |
+| `1`                   | Generic failure / non-passed run status                                                           |
+| `2`                   | Not yet implemented                                                                               |
+| `3`                   | Auth error                                                                                        |
+| `4`                   | Not found                                                                                         |
+| `5`                   | Validation error / payload too large                                                              |
+| `6`                   | Conflict / precondition failed                                                                    |
+| `7`                   | Timeout / unsupported                                                                             |
+| `10`                  | Service unavailable                                                                               |
+| `11`                  | Rate limited (retriable)                                                                          |
+| `12`                  | Insufficient credits (non-retriable)                                                              |
+| `13`                  | Feature gated (paid plan required)                                                                |
+| `14`                  | Client too old — the backend requires a newer CLI (HTTP 426 `CLIENT_TOO_OLD`); upgrade to proceed |
+| `129` / `130` / `143` | Interrupted by a signal (SIGHUP / SIGINT / SIGTERM) — `128 + signal number`                       |
 
 ### Signals & pipes
 
-On SIGINT (Ctrl-C), SIGTERM, or SIGHUP the CLI prints `Interrupted (<signal>). Any run already started keeps executing on the server; check it with 'testsprite test list' or 'testsprite test wait <run-id>'.` and exits `128 + signal`. **Ctrl-C does not cancel the server-side run** — execution (and any credit spend) continues; there is no cancel command today, so re-attach with `test wait <run-id>` instead of re-triggering. A closed stdout pipe (`EPIPE`, e.g. `testsprite test list | head`) exits `0` silently rather than crashing.
+During any `--wait`, SIGINT (Ctrl-C), SIGTERM, or SIGHUP triggers a **graceful detach**: the in-flight request aborts immediately, stdout gets the same partial `{ runId, status: "running" }` envelope as the request-timeout path (under `--output json`, stderr carries an `INTERRUPTED` envelope naming the signal), and stderr states the truth — the server-side run keeps executing, and any credit spend continues — with a re-attach hint (`test wait <run-id>`) and a `test cancel <run-id>` pointer. The exit code is `128 + signal` (130 / 143 / 129). A second signal forces an immediate hard exit. Outside a `--wait` (prompts, one-shot commands), signals keep the pre-existing immediate-exit behavior. **Ctrl-C never cancels the server-side run** — `test cancel <run-id...>` is the explicit stop. A closed stdout pipe (`EPIPE`, e.g. `testsprite test list | head`) exits `0` silently rather than crashing.
 
 ## Design principles
 

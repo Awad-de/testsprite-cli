@@ -59,6 +59,8 @@ describe('exitCodeFor', () => {
     ['UNAVAILABLE', 10],
     ['RATE_LIMITED', 11],
     ['INSUFFICIENT_CREDITS', 12],
+    ['FEATURE_GATED', 13],
+    ['CLIENT_TOO_OLD', 14],
     ['INTERNAL', 1],
   ] as const)('%s → exit %d', (code, expected) => {
     expect(exitCodeFor(code)).toBe(expected);
@@ -138,6 +140,7 @@ describe('ApiError.fromEnvelope status fallback', () => {
     [403, 'AUTH_FORBIDDEN' as const],
     [404, 'NOT_FOUND' as const],
     [409, 'CONFLICT' as const],
+    [426, 'CLIENT_TOO_OLD' as const],
     [429, 'RATE_LIMITED' as const],
     [501, 'UNSUPPORTED' as const],
     [503, 'UNAVAILABLE' as const],
@@ -155,6 +158,25 @@ describe('ApiError.fromEnvelope status fallback', () => {
     );
     expect(err.code).toBe('UNAVAILABLE');
     expect(err.exitCode).toBe(10);
+  });
+
+  it('recognizes a well-formed CLIENT_TOO_OLD (426) envelope and echoes the version details', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'CLIENT_TOO_OLD',
+          message: 'Your CLI is older than the minimum supported version.',
+          nextAction: 'Upgrade with npm i -g @testsprite/testsprite-cli@latest.',
+          requestId: 'req_old',
+          details: { minVersion: '1.0.0', yourVersion: '0.9.0' },
+        },
+      },
+      426,
+    );
+    // The code is in the union, so it is trusted directly — NOT remapped.
+    expect(err.code).toBe('CLIENT_TOO_OLD');
+    expect(err.exitCode).toBe(14);
+    expect(err.details).toEqual({ minVersion: '1.0.0', yourVersion: '0.9.0' });
   });
 
   // Track A dogfood: NestJS raw 404 (route not registered) has the

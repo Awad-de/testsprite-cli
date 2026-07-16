@@ -937,3 +937,113 @@ describe('runDeleteBatch (dogfood L1796)', () => {
     expect(flagNames).toContain('--status');
   });
 });
+
+// ---------------------------------------------------------------------------
+// DEV-331 (codex finding 2) — create-batch --run --wait interrupt partial
+// carries the dispatched runIds, not empty placeholders
+// ---------------------------------------------------------------------------
+
+describe('create-batch --run --wait — InterruptError partial names dispatched runIds (DEV-331)', () => {
+  it('interrupt mid-poll → partial rows carry the runIds recorded at trigger time', async () => {
+    const creds = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-dev331-cbrun-'));
+    for (let i = 0; i < 2; i++) {
+      writeFileSync(
+        join(dir, `plan_${i}.json`),
+        JSON.stringify({ ...PLAN_SPEC, name: `Plan ${i}` }),
+        'utf8',
+      );
+    }
+
+    const { ShutdownController } = await import('../lib/interrupt.js');
+    const { InterruptError } = await import('../lib/errors.js');
+    const shutdown = new ShutdownController();
+
+    // batch create resolves; each trigger POST resolves with a per-test runId;
+    // every run poll hangs until the composed signal aborts.
+    const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      if (url.includes('/tests/batch') && init.method === 'POST') {
+        return new Response(JSON.stringify(batchCreateResp(2)), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (init.method === 'POST' && /\/tests\/[^/]+\/runs$/.test(url)) {
+        const testId = /\/tests\/([^/]+)\/runs$/.exec(url)![1]!;
+        return new Response(
+          JSON.stringify({
+            runId: `run_${testId}`,
+            status: 'queued',
+            enqueuedAt: '2026-07-09T10:00:00.000Z',
+            codeVersion: 'v1',
+            targetUrl: 'https://example.com',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      // GET /runs/{id} long-poll: hang until aborted.
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init.signal;
+        const rejectWithReason = (): void => {
+          const reason: unknown = signal?.reason;
+          reject(reason instanceof Error ? reason : new Error('aborted'));
+        };
+        if (signal?.aborted) {
+          rejectWithReason();
+          return;
+        }
+        signal?.addEventListener('abort', rejectWithReason, { once: true });
+      });
+    }) as typeof globalThis.fetch;
+
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    const pending = runCreateBatch(
+      {
+        plans: '',
+        planFromDir: dir,
+        run: true,
+        wait: true,
+        timeoutSeconds: 600,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        fetchImpl,
+        stdout: (l: string) => stdoutLines.push(l),
+        stderr: (l: string) => stderrLines.push(l),
+        sleep: () => Promise.resolve(),
+        shutdown,
+      },
+    );
+    setTimeout(() => shutdown.interrupt('SIGINT'), 25);
+
+    const err = await pending.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+
+    // The partial must name the real runIds recorded at trigger time —
+    // members mid-poll have no settled result, but their runId is known.
+    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
+      results: Array<{ testId: string; runId: string; status: string }>;
+    };
+    const byTestId = new Map(stdoutJson.results.map(r => [r.testId, r]));
+    expect(byTestId.get('test_batch_0')?.runId).toBe('run_test_batch_0');
+    expect(byTestId.get('test_batch_0')?.status).toBe('running');
+    expect(byTestId.get('test_batch_1')?.runId).toBe('run_test_batch_1');
+
+    const stderrBlock = stderrLines.join('\n');
+    expect(stderrBlock).toContain('billing');
+    expect(stderrBlock).toContain('run_test_batch_0');
+    expect(stderrBlock).toContain('run_test_batch_1');
+  });
+});

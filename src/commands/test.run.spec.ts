@@ -10,7 +10,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, RequestTimeoutError } from '../lib/errors.js';
+import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import { ShutdownController } from '../lib/interrupt.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { RunResponse, TriggerRunResponse, BatchRunFreshResponse } from '../lib/runs.types.js';
@@ -1698,6 +1699,88 @@ describe('C2 — backend run renders steps: n/a (backend) in text mode', () => {
     // Fast BE: type hint → n/a (backend) even though beFallbackUsed is false
     expect(out).toContain('steps       n/a (backend)');
     expect(out).not.toContain('0/0');
+  });
+
+  it('standalone BE run --wait: text probes /tests/{id} → n/a (backend); JSON never probes (DEV-282)', async () => {
+    // Standalone `test run <id>` supplies NO type hint, and the run row is
+    // terminal on the first poll (BE rows finalize server-side now), so
+    // `beFallbackUsed` stays false. In TEXT mode the card must still read
+    // `n/a (backend)`, resolved via a one-time `GET /tests/{id}` probe; in JSON
+    // mode the output is already correct and must NOT pay for that round-trip.
+    const { credentialsPath } = makeCreds();
+    const passedBeRun: RunResponse = {
+      runId: 'run_282',
+      testId: 'be_282',
+      projectId: 'p1',
+      userId: 'u1',
+      status: 'passed',
+      source: 'cli',
+      createdAt: '2026-05-15T10:00:00.000Z',
+      startedAt: '2026-05-15T10:00:01.000Z',
+      finishedAt: '2026-05-15T10:00:02.000Z',
+      codeVersion: 'v1',
+      targetUrl: 'https://example.com',
+      createdFrom: null,
+      failedStepIndex: null,
+      failureKind: null,
+      error: null,
+      videoUrl: null,
+      stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
+    };
+    const makeHandler = (urls: string[]) => (url: string) => {
+      urls.push(url);
+      if (url.includes('/tests/be_282/runs')) {
+        return {
+          body: {
+            runId: 'run_282',
+            status: 'queued',
+            enqueuedAt: '2026-05-15T10:00:00.000Z',
+            codeVersion: 'v1',
+            targetUrl: 'https://example.com',
+          },
+        };
+      }
+      if (url.includes('/runs/run_282')) return { body: passedBeRun };
+      // Bare type probe: GET /tests/be_282 (no /runs, no /result suffix).
+      if (/\/tests\/be_282$/.test(url)) return { body: { id: 'be_282', type: 'backend' } };
+      return { status: 404, body: {} };
+    };
+    const runOnce = async (output: 'text' | 'json') => {
+      const urls: string[] = [];
+      const stdoutLines: string[] = [];
+      await runTestRun(
+        {
+          profile: 'default',
+          output,
+          debug: false,
+          dryRun: false,
+          testId: 'be_282',
+          wait: true,
+          timeoutSeconds: 60,
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(makeHandler(urls)),
+          stdout: line => stdoutLines.push(line),
+          stderr: () => {},
+          sleep: instantSleep,
+        },
+      );
+      return { urls, out: stdoutLines.join('\n') };
+    };
+
+    // Text mode: probes the type and renders the honest backend placeholder.
+    const text = await runOnce('text');
+    expect(text.out).toContain('steps       n/a (backend)');
+    expect(text.out).not.toContain('0/0');
+    expect(text.urls.some(u => /\/tests\/be_282$/.test(u))).toBe(true);
+
+    // JSON mode: no extra probe; the wire envelope ships stepSummary verbatim.
+    const json = await runOnce('json');
+    expect(json.urls.some(u => /\/tests\/be_282$/.test(u))).toBe(false);
+    const parsed = JSON.parse(json.out);
+    expect(parsed.status).toBe('passed');
+    expect(parsed.stepSummary).toEqual({ total: 0, completed: 0, passedCount: 0, failedCount: 0 });
   });
 });
 
@@ -3746,5 +3829,82 @@ describe('[finding-5] runTestRunAll --wait: RequestTimeoutError during fan-out p
     expect(parsed.accepted).toHaveLength(2);
     expect(parsed.accepted.map(r => r.runId).sort()).toEqual(['run_fresh_01', 'run_fresh_02']);
     expect(parsed.accepted.every(r => r.status === 'timeout')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEV-331 piece 1 — graceful detach on SIGINT during test run --wait
+// ---------------------------------------------------------------------------
+
+describe('runTestRun --wait — InterruptError graceful detach (DEV-331)', () => {
+  it('SIG-1: trigger succeeds, poll interrupted → partial to stdout + honest stderr + exit 130', async () => {
+    const { credentialsPath } = makeCreds();
+    const shutdown = new ShutdownController();
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+
+    // Trigger POST resolves; the subsequent GET /runs/{id} long-poll hangs
+    // until the composed signal aborts (real-fetch contract).
+    const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      if (init.method === 'POST') {
+        return new Response(JSON.stringify(TRIGGER_RESP), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      void url;
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init.signal;
+        const rejectWithReason = (): void => {
+          const reason: unknown = signal?.reason;
+          reject(reason instanceof Error ? reason : new Error('aborted'));
+        };
+        if (signal?.aborted) {
+          rejectWithReason();
+          return;
+        }
+        signal?.addEventListener('abort', rejectWithReason, { once: true });
+      });
+    }) as typeof globalThis.fetch;
+
+    const pending = runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 600,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+        shutdown,
+      },
+    );
+    setTimeout(() => shutdown.interrupt('SIGINT'), 5);
+
+    const err = await pending.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect((err as InterruptError).exitCode).toBe(130);
+
+    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as { runId: string; status: string };
+    expect(stdoutJson.runId).toBe('run_abc');
+    expect(stdoutJson.status).toBe('running');
+
+    const stderrBlock = stderrLines.join('\n');
+    expect(stderrBlock).toContain('Interrupted (SIGINT)');
+    expect(stderrBlock).toContain('billing');
+    expect(stderrBlock).toContain('testsprite test wait run_abc');
   });
 });

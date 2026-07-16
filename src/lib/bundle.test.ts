@@ -601,6 +601,25 @@ describe('resolveBundleDir', () => {
     const out = resolveBundleDir('/tmp/x/');
     expect(out).toBe('/tmp/x');
   });
+
+  // `C:\...` is only recognized as absolute by node:path when the process
+  // itself is running on win32 (path.isAbsolute/resolve are platform-native,
+  // not path.win32.* explicitly) — these two assertions are only meaningful
+  // under an actual Windows runtime, hence gated rather than run everywhere.
+  it.runIf(process.platform === 'win32')(
+    'strips a trailing backslash (native Windows path)',
+    () => {
+      const out = resolveBundleDir('C:\\Users\\me\\bundle\\');
+      expect(out).toBe('C:\\Users\\me\\bundle');
+    },
+  );
+
+  it.runIf(process.platform === 'win32')(
+    'preserves a bare Windows drive root instead of truncating it to a drive-relative path',
+    () => {
+      expect(resolveBundleDir('C:\\')).toBe('C:\\');
+    },
+  );
 });
 
 describe('streamUrlToFile retry', () => {

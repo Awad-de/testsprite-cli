@@ -109,11 +109,36 @@ npm run format:check   # Prettier (check only)
 npm run typecheck      # tsc --noEmit
 ```
 
+## Developing on Windows
+
+Native Windows (no WSL, no Git Bash required) is a fully supported dev
+environment — you only need **git** and **Node ≥ 20**. `npm ci`, `npm run
+build`, `npm test`, `npm run lint`, and `npm run typecheck` all run the same
+way as on macOS/Linux, and CI runs the unit suite on `windows-latest` as the
+reference environment (see [CI gates](#ci-gates-required-for-merge) below) —
+if it's green there, it's green on your machine.
+
+A couple of things worth knowing:
+
+- Line endings are normalized to LF on checkout via `.gitattributes`
+  (`core.autocrlf` doesn't need any special local configuration).
+- `--out`/bundle-path flags accept native Windows paths (`C:\Users\...`)
+  including a trailing backslash and a bare drive root (`C:\`).
+- A small number of tests that create real filesystem symlinks are skipped on
+  Windows (creating a symlink there needs Administrator rights or Developer
+  Mode, which isn't guaranteed on hosted CI) — the safety behavior they cover
+  is still exercised on the Linux/macOS CI jobs.
+
+Hit something that doesn't work on Windows? Please file it — see
+[Questions & support](#questions--support) above, and feel free to tag it
+`good first issue` if it looks like an isolated fix; we'd rather know than
+have you route around it silently.
+
 ## CI gates (required for merge)
 
 - ESLint + Prettier clean
 - TypeScript type-check clean
-- All unit tests passing
+- All unit tests passing on Linux (Node 20 + 22) **and** on Windows (`windows-latest`, Node 22)
 - Coverage ≥ 80% on lines / statements / functions / branches
 - Build + smoke test of the CLI binary
 

@@ -850,6 +850,63 @@ describe('runWhoami', () => {
     expect(printed).toEqual(sampleMe);
   });
 
+  it('renders routing: v3 and the gap advisory when v3Enabled is true', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meV3 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meV3) },
+    );
+    expect(capture.stdout.join('\n')).toContain('routing: v3');
+    expect(capture.stderr.join('\n')).toContain('[advisory]');
+    expect(capture.stderr.join('\n')).toContain('test cancel');
+  });
+
+  it('renders routing: v2 and NO advisory when v3Enabled is false', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meV2 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: false }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meV2) },
+    );
+    expect(capture.stdout.join('\n')).toContain('routing: v2');
+    expect(capture.stderr.join('\n')).not.toContain('[advisory]');
+  });
+
+  it('omits the routing line when the backend does not return v3Enabled', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meResponse()) },
+    );
+    expect(capture.stdout.join('\n')).not.toContain('routing:');
+  });
+
+  it('does not emit the advisory in JSON mode even when v3Enabled is true', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meV3 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    await runWhoami(
+      { profile: 'default', output: 'json', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meV3) },
+    );
+    expect(capture.stderr.join('\n')).not.toContain('[advisory]');
+    const parsed = JSON.parse(capture.stdout.join('')) as MeResponse;
+    expect(parsed.v3Enabled).toBe(true);
+  });
+
   it('dry-run: whitespace-only TESTSPRITE_API_URL falls through to prod default endpoint', async () => {
     const { capture, deps } = makeCapture();
     await runWhoami(

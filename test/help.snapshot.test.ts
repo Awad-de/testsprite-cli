@@ -13,6 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { execNpm } from './helpers/execNpm.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..');
@@ -43,11 +44,13 @@ const cases: Array<[string, string[]]> = [
   // R5: regression guard for commands that gained new flag wording
   ['test create-batch', ['test', 'create-batch', '--help']],
   ['test run', ['test', 'run', '--help']],
+  // DEV-331 piece 3
+  ['test cancel', ['test', 'cancel', '--help']],
 ];
 
 describe('--help snapshots', () => {
   beforeAll(() => {
-    execFileSync('npm', ['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
+    execNpm(['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
   });
 
   for (const [name, args] of cases) {

@@ -9,8 +9,10 @@
 # CI workflows (CI + Test Coverage) can complete in any order.
 #
 # Bot identity: same App-token-first / GITHUB_TOKEN-fallback pattern as
-# pr-triage.yml (the App needs the "Pull requests: Read & write" permission to
-# post as testsprite-hob[bot]; until then comments come from github-actions[bot]).
+# pr-triage.yml. The App has had the "Pull requests: Read & write" permission
+# since 2026-07-02 (corrected 2026-07-15; this comment previously said the
+# permission was still pending) — the fallback path stays as defense-in-depth
+# for whenever the App/secrets are absent.
 name: CI failure nudge
 
 on:
@@ -40,8 +42,20 @@ jobs:
         with:
           app-id: ${{ secrets.TESTSPRITE_HOB_APP_ID || secrets.ALFHEIM_AGENT_APP_ID }}
           private-key: ${{ secrets.TESTSPRITE_HOB_PRIVATE_KEY || secrets.ALFHEIM_AGENT_PRIVATE_KEY }}
+          # The script below only ever calls the App client (`appClient`) for
+          # rest.issues.updateComment/createComment — PR comments ride the
+          # issues API (see the header comment above). All reads (checks,
+          # pulls, commit->PR lookup) go through the ambient `github` client,
+          # governed by this workflow's top-level `permissions:` block, not
+          # this minted token. Scoping to checks:read/pull-requests:write here
+          # (matching the job's top-level block literally) would risk the mint
+          # itself failing if the App's installation doesn't hold Checks
+          # permission — which would silently drop the App-token path
+          # entirely (continue-on-error swallows the failure) and always fall
+          # back to github-actions[bot], defeating this bot's own purpose.
+          permission-issues: write
 
-      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.0.1
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
         with:
@@ -82,14 +96,20 @@ jobs:
               'Build': 'run `npm run build` and fix the compile errors',
               'Local E2E Tests': 'run `npm run test:e2e` (it builds first)',
               'Coverage (>= 80%)': 'run `npm run test:coverage` — new code needs tests until every metric is back at 80%',
+              'Secret scan (gitleaks)': 'run `gitleaks detect --no-git --redact --source .` locally (config: .gitleaks.toml) and remove the secret — or, for a provable false positive, add a narrowly-anchored allowlist regex',
             };
+            // Matrix jobs publish check runs as "Unit Tests (Node 20)" etc. —
+            // exact lookup alone would silently skip them (and the nudge would
+            // say "all green" while they are red). Try exact first, then the
+            // name with a trailing parenthetical stripped (review round 2).
+            const fixFor = (name) => FIX[name] ?? FIX[name.replace(/\s*\([^)]*\)$/, '')];
 
             // Recompute full CI state from this SHA's check runs, narrowed to the
             // CI jobs above — other workflows (e.g. pr-triage) also attach
             // github-actions check runs to the PR head and must not count here.
             const checks = await github.paginate(github.rest.checks.listForRef,
               { owner, repo, ref: run.head_sha, per_page: 100 });
-            const ours = checks.filter(c => c.app && c.app.slug === 'github-actions' && FIX[c.name]);
+            const ours = checks.filter(c => c.app && c.app.slug === 'github-actions' && fixFor(c.name));
             const failing = ours.filter(c => ['failure', 'timed_out'].includes(c.conclusion));
             const pending = ours.filter(c => c.status !== 'completed');
 
@@ -110,7 +130,7 @@ jobs:
             const lines = failing
               .sort((a, b) => a.name.localeCompare(b.name))
               .map(c => {
-                const fix = FIX[c.name] || 'see the logs for details';
+                const fix = fixFor(c.name) || 'see the logs for details';
                 return `- **${c.name}** — ${fix} ([logs](${c.html_url}))`;
               });
             const body = `${marker}\nThanks, @${pr.user.login}! CI is red on this PR — `

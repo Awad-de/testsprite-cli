@@ -7,7 +7,7 @@
  * and runs `auth whoami` against the mock."
  */
 
-import { execFileSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { execNpm } from './helpers/execNpm.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..');
@@ -37,7 +38,7 @@ beforeAll(async () => {
   // existsSync skip we used to do here let `dist` rot under
   // refactors and gave false-green on `project list` once
   // already.
-  execFileSync('npm', ['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
+  execNpm(['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
   server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = req.url ?? '/';
     if (url.startsWith('/api/cli/v1/projects/')) {
