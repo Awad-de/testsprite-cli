@@ -6,11 +6,13 @@ import { ApiError } from '../lib/errors.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import {
   type CliProject,
+  type CliDeleteProjectResponse,
   type CliUpdateProjectResponse,
   createProjectCommand,
   runAutoAuth,
   runCreate,
   runCredential,
+  runDelete,
   runGet,
   runList,
   runUpdate,
@@ -74,10 +76,10 @@ describe('createProjectCommand', () => {
     errorSpy.mockRestore();
   });
 
-  it('exposes list, get, create, update, credential and auto-auth subcommands', () => {
+  it('exposes list, get, create, update, delete, credential and auto-auth subcommands', () => {
     const project = createProjectCommand();
     const names = project.commands.map(c => c.name()).sort();
-    expect(names).toEqual(['auto-auth', 'create', 'credential', 'get', 'list', 'update']);
+    expect(names).toEqual(['auto-auth', 'create', 'credential', 'delete', 'get', 'list', 'update']);
   });
 
   it('list exposes the pagination flags from the design contract', () => {
@@ -681,6 +683,34 @@ describe('runCreate', () => {
     ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it('rejects --description with VALIDATION_ERROR (exit 5), no network — projects have no description', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network — validation must fire client-side');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'frontend',
+          name: 'Desc Project',
+          targetUrl: 'https://example.com',
+          description: 'a human description',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -943,6 +973,140 @@ describe('runUpdate', () => {
 
     expect(result.id).toBe('proj_json_no_fields');
     expect(result.updatedFields).toBeUndefined();
+  });
+});
+
+describe('runDelete', () => {
+  it('refuses without --confirm and never hits the network (exit 5)', async () => {
+    const { credentialsPath } = makeCreds();
+    let called = 0;
+    const fetchImpl = makeFetch(() => {
+      called += 1;
+      return { body: {} };
+    });
+    await expect(
+      runDelete(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_alpha',
+          confirm: false,
+        },
+        { credentialsPath, fetchImpl, stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'confirm' }),
+    });
+    expect(called).toBe(0);
+  });
+
+  it('DELETEs /projects/{id} with a minted idempotency-key when --confirm is set', async () => {
+    const { credentialsPath } = makeCreds();
+    const deleteResponse: CliDeleteProjectResponse = {
+      projectId: 'proj_alpha',
+      deletedAt: '2026-05-16T10:00:00.000Z',
+    };
+    let seenUrl = '';
+    let seenMethod = '';
+    let seenIdemKey: string | null = null;
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      seenUrl = typeof input === 'string' ? input : (input as { url: string }).url;
+      seenMethod = init.method ?? 'GET';
+      seenIdemKey = new Headers(init.headers).get('idempotency-key');
+      return new Response(JSON.stringify(deleteResponse), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    const result = await runDelete(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_alpha',
+        confirm: true,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+
+    expect(seenMethod).toBe('DELETE');
+    expect(seenUrl).toContain('/api/cli/v1/projects/proj_alpha');
+    expect(seenIdemKey).toMatch(/^cli-delete-[0-9a-f-]{36}$/);
+    expect(result.projectId).toBe('proj_alpha');
+    expect(result.deletedAt).toBe('2026-05-16T10:00:00.000Z');
+  });
+
+  it('forwards a caller-supplied --idempotency-key verbatim', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenIdemKey: string | null = null;
+    const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      seenIdemKey = new Headers(init.headers).get('idempotency-key');
+      return new Response(
+        JSON.stringify({ projectId: 'proj_alpha', deletedAt: '2026-05-16T10:00:00.000Z' }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+
+    await runDelete(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_alpha',
+        confirm: true,
+        idempotencyKey: 'idem-del-001',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+
+    expect(seenIdemKey).toBe('idem-del-001');
+  });
+
+  it('--dry-run bypasses --confirm and returns the canned sample without network', async () => {
+    resetDryRunBannerForTesting();
+    const { credentialsPath } = makeCreds();
+    const err: string[] = [];
+    // No fetchImpl → the client-factory dry-run fetch serves the samples.ts value.
+    const result = await runDelete(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'project_b3c91efa',
+        confirm: false,
+      },
+      { credentialsPath, stdout: () => {}, stderr: line => err.push(line) },
+    );
+
+    expect(result.projectId).toBe('project_b3c91efa');
+    expect(result.deletedAt).toBe('2026-05-16T00:00:00.000Z');
+    expect(err).toContain(DRY_RUN_BANNER);
+  });
+
+  it('renders text mode with projectId and deletedAt', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { projectId: 'proj_text', deletedAt: '2026-05-16T10:00:00.000Z' },
+    }));
+    const out: string[] = [];
+    await runDelete(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_text',
+        confirm: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
+    );
+    const block = out.join('\n');
+    expect(block).toContain('projectId proj_text');
+    expect(block).toContain('deletedAt 2026-05-16T10:00:00.000Z');
   });
 });
 

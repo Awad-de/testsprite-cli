@@ -26,6 +26,7 @@ import { ApiError, CLIError, localValidationError } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, type OutputMode } from '../lib/output.js';
 import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
+import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 import { VERSION } from '../version.js';
 import { MIN_SUPPORTED_NODE_MAJOR, shouldRejectNodeVersion } from '../version-guard.js';
 
@@ -49,6 +50,7 @@ export interface DoctorReport {
 interface MeIdentity {
   userId?: string;
   keyId?: string;
+  v3Enabled?: boolean;
 }
 
 export interface DoctorDeps {
@@ -81,6 +83,12 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   });
   const endpointCheck = checkEndpoint(config.apiUrl);
   const hasKey = Boolean(config.apiKey);
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+
+  const connectivity = await checkConnectivity(opts, deps, {
+    hasKey,
+    endpointOk: endpointCheck.status === 'ok',
+  });
 
   const checks: DoctorCheck[] = [
     { name: 'CLI version', status: 'ok', detail: VERSION },
@@ -88,18 +96,33 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     { name: 'Profile', status: 'ok', detail: config.profile },
     endpointCheck,
     checkCredentials(hasKey, config.profile, opts.dryRun ?? false),
-    await checkConnectivity(opts, deps, {
-      hasKey,
-      endpointOk: endpointCheck.status === 'ok',
-    }),
-    checkSkill(cwd, deps),
+    connectivity.check,
   ];
+
+  // Informational routing line, only when the backend reported it (no new call).
+  if (connectivity.v3Enabled !== undefined) {
+    const label = routingLabel(connectivity.v3Enabled);
+    checks.push({
+      name: 'Routing',
+      status: 'ok',
+      detail:
+        connectivity.v3Enabled === true
+          ? `${label} (V3 execution routing is ON)`
+          : `${label} (default routing)`,
+    });
+  }
+
+  checks.push(checkSkill(cwd, deps));
 
   const failures = checks.filter(check => check.status === 'fail').length;
   const warnings = checks.filter(check => check.status === 'warn').length;
   const report: DoctorReport = { checks, failures, warnings };
 
   out.print(report, () => renderDoctor(report));
+
+  if (connectivity.v3Enabled === true) {
+    emitV3RoutingAdvisory(stderr);
+  }
 
   if (failures > 0) {
     // Non-zero exit so `testsprite doctor && ...` gates a CI step or an agent
@@ -175,11 +198,13 @@ async function checkConnectivity(
   opts: CommonOptions,
   deps: DoctorDeps,
   ctx: { hasKey: boolean; endpointOk: boolean },
-): Promise<DoctorCheck> {
+): Promise<{ check: DoctorCheck; v3Enabled?: boolean }> {
   const name = 'Connectivity';
-  if (opts.dryRun) return { name, status: 'warn', detail: 'skipped under --dry-run' };
-  if (!ctx.hasKey) return { name, status: 'warn', detail: 'skipped; no API key to test with' };
-  if (!ctx.endpointOk) return { name, status: 'warn', detail: 'skipped; endpoint URL is invalid' };
+  if (opts.dryRun) return { check: { name, status: 'warn', detail: 'skipped under --dry-run' } };
+  if (!ctx.hasKey)
+    return { check: { name, status: 'warn', detail: 'skipped; no API key to test with' } };
+  if (!ctx.endpointOk)
+    return { check: { name, status: 'warn', detail: 'skipped; endpoint URL is invalid' } };
 
   try {
     const client = makeHttpClient(opts, {
@@ -190,7 +215,10 @@ async function checkConnectivity(
     });
     const me = await client.get<MeIdentity>('/me');
     const who = me.userId ? ` (userId ${me.userId})` : '';
-    return { name, status: 'ok', detail: `reached GET /me, API key accepted${who}` };
+    return {
+      check: { name, status: 'ok', detail: `reached GET /me, API key accepted${who}` },
+      v3Enabled: me.v3Enabled,
+    };
   } catch (error) {
     if (error instanceof ApiError) {
       if (
@@ -198,14 +226,16 @@ async function checkConnectivity(
         error.code === 'AUTH_INVALID' ||
         error.code === 'AUTH_FORBIDDEN'
       ) {
-        return { name, status: 'fail', detail: `API key rejected (${error.code})` };
+        return { check: { name, status: 'fail', detail: `API key rejected (${error.code})` } };
       }
-      return { name, status: 'fail', detail: `GET /me failed (${error.code})` };
+      return { check: { name, status: 'fail', detail: `GET /me failed (${error.code})` } };
     }
     return {
-      name,
-      status: 'fail',
-      detail: `GET /me failed (${error instanceof Error ? error.message : String(error)})`,
+      check: {
+        name,
+        status: 'fail',
+        detail: `GET /me failed (${error instanceof Error ? error.message : String(error)})`,
+      },
     };
   }
 }

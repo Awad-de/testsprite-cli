@@ -146,6 +146,14 @@ Commands:
   get <project-id>                   Get a project by id
   create [options]                   Create a new project
   update [options] <project-id>      Update project metadata
+  delete [options] <project-id>      Permanently delete a project and everything under it (sub-projects,
+  their tests, and backend fixtures). Requires --confirm.
+  
+  Exit codes:
+    0  success
+    3  auth error
+    4  project not found (or already deleted)
+    5  validation error (e.g., missing --confirm)
   credential [options] <project-id>  Set the static backend credential injected
                                      into every backend test
                                      (Bearer token / API key / Basic token /
@@ -260,11 +268,14 @@ Commands:
     4  test not found
     5  validation error (e.g., bad --target-url, or positional + --all both set)
     6  conflict (already running — see nextAction for the active runId)
-    7  timeout — resume with: testsprite test wait <run-id>
+    7  timeout — resume with: testsprite test wait <run-id>, or stop it with: testsprite test cancel <run-id>
    10  transport/network failure (UNAVAILABLE) — retry the command
    11  rate limited — honor Retry-After
   
   On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
+  
+  Ctrl-C during --wait detaches only (the run keeps executing and billing);
+  stop it for real with: testsprite test cancel <run-id>
   wait [options] <run-id...>            Wait for one or more runs to reach a terminal status.
   
   With several run-ids the runs are polled concurrently under one shared
@@ -282,6 +293,9 @@ Commands:
    10  transport/network failure (UNAVAILABLE) — retry the command
   
   On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
+  
+  Ctrl-C detaches only (the run keeps executing and billing); stop it for
+  real with: testsprite test cancel <run-id...>
   rerun [options] [test-ids...]         Re-execute a test (or multiple) as a cheap replay — FE replays the saved script (no credit), BE re-runs the dependency closure.
   
   Exit codes:
@@ -291,10 +305,13 @@ Commands:
     4  test not found
     5  validation error
     6  conflict (already running — see nextAction for the active runId)
-    7  timeout or deferred — resume with: testsprite test wait <run-id>
+    7  timeout or deferred — resume with: testsprite test wait <run-id>, or stop it with: testsprite test cancel <run-id>
    11  rate limited — honor Retry-After
   
   On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
+  
+  Ctrl-C during --wait detaches only (the run keeps executing and billing);
+  stop it for real with: testsprite test cancel <run-id>
   flaky [options] <test-id>             Repeatedly replay a test to measure stability and surface flakiness.
   Replays run with auto-heal OFF (strict verbatim) so healed drift cannot mask nondeterministic pass/fail.
   
@@ -309,7 +326,48 @@ Commands:
   failure                               Export the latest-failure agent bundle
   artifact                              Download run-scoped artifact bundles
                                         (M3.3 piece-4)
+  cancel <run-id...>                    Cancel one or more queued/running runs.
+  
+  Ctrl-C during --wait only detaches — it does NOT cancel the server-side
+  run. This is the real stop button. No refund is issued for the credits
+  already charged at trigger time (D3); an in-flight Lambda finishes on its
+  own and its result is discarded once cancelled.
+  
+  Exit codes:
+    0  cancelled (fresh or already-cancelled — naturally idempotent)
+    4  run id not found (single id), or ANY id not found (multi-id — outranks conflict)
+    6  run already terminal (passed/failed/blocked) — single id: 409; multi-id: any conflict
+  
+  Multi-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound}.
   help [command]                        display help for command
+"
+`;
+
+exports[`--help snapshots > test cancel 1`] = `
+"Usage: testsprite test cancel [options] <run-id...>
+
+Cancel one or more queued/running runs.
+
+Ctrl-C during --wait only detaches — it does NOT cancel the server-side
+run. This is the real stop button. No refund is issued for the credits
+already charged at trigger time (D3); an in-flight Lambda finishes on its
+own and its result is discarded once cancelled.
+
+Exit codes:
+  0  cancelled (fresh or already-cancelled — naturally idempotent)
+  4  run id not found (single id), or ANY id not found (multi-id — outranks conflict)
+  6  run already terminal (passed/failed/blocked) — single id: 409; multi-id: any conflict
+
+Multi-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound}.
+
+Arguments:
+  run-id      one or more run ids to cancel
+
+Options:
+  -h, --help  display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
 "
 `;
 
@@ -463,10 +521,13 @@ Exit codes:
   4  test not found
   5  validation error
   6  conflict (already running — see nextAction for the active runId)
-  7  timeout or deferred — resume with: testsprite test wait <run-id>
+  7  timeout or deferred — resume with: testsprite test wait <run-id>, or stop it with: testsprite test cancel <run-id>
  11  rate limited — honor Retry-After
 
 On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
+
+Ctrl-C during --wait detaches only (the run keeps executing and billing);
+stop it for real with: testsprite test cancel <run-id>
 
 Options:
   --all                       rerun all tests in the resolved project (requires
@@ -568,11 +629,14 @@ Exit codes:
   4  test not found
   5  validation error (e.g., bad --target-url, or positional + --all both set)
   6  conflict (already running — see nextAction for the active runId)
-  7  timeout — resume with: testsprite test wait <run-id>
+  7  timeout — resume with: testsprite test wait <run-id>, or stop it with: testsprite test cancel <run-id>
  10  transport/network failure (UNAVAILABLE) — retry the command
  11  rate limited — honor Retry-After
 
 On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
+
+Ctrl-C during --wait detaches only (the run keeps executing and billing);
+stop it for real with: testsprite test cancel <run-id>
 
 Options:
   --target-url <url>          override the project default env URL for this run

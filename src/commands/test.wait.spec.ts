@@ -10,7 +10,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
-import { ApiError, RequestTimeoutError } from '../lib/errors.js';
+import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import { ShutdownController } from '../lib/interrupt.js';
 import type { RunResponse } from '../lib/runs.types.js';
 import { runTestWait } from './test.js';
 
@@ -1303,5 +1304,124 @@ describe('runTestWait — dashboardUrl on terminal output', () => {
     );
     const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
     expect(printed.dashboardUrl).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEV-331 piece 1 — graceful detach on SIGINT/SIGTERM during test wait
+// ---------------------------------------------------------------------------
+
+describe('runTestWait — InterruptError graceful detach (DEV-331)', () => {
+  function hangingFetch(): typeof globalThis.fetch {
+    return (async (_input: FetchInput, init: RequestInit = {}) => {
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init.signal;
+        const rejectWithReason = (): void => {
+          const reason: unknown = signal?.reason;
+          reject(reason instanceof Error ? reason : new Error('aborted'));
+        };
+        if (signal?.aborted) {
+          rejectWithReason();
+          return;
+        }
+        signal?.addEventListener('abort', rejectWithReason, { once: true });
+      });
+    }) as typeof globalThis.fetch;
+  }
+
+  it('SIG-2/SIG-4: emits partial JSON to stdout, honest billing line to stderr, rethrows exit 130', async () => {
+    const { credentialsPath } = makeCreds();
+    const shutdown = new ShutdownController();
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+
+    const pending = runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 600,
+      },
+      {
+        credentialsPath,
+        fetchImpl: hangingFetch(),
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+        shutdown,
+      },
+    );
+    // Simulate Ctrl-C while the long-poll fetch is in flight.
+    setTimeout(() => shutdown.interrupt('SIGINT'), 5);
+
+    const err = await pending.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect((err as InterruptError).exitCode).toBe(130);
+    expect((err as InterruptError).signal).toBe('SIGINT');
+
+    // Stdout stays parseable and carries the runId for re-attach.
+    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as { runId: string; status: string };
+    expect(stdoutJson.runId).toBe('run_abc');
+    expect(stdoutJson.status).toBe('running');
+
+    // The honest line: run keeps executing AND billing; re-attach hint.
+    const stderrBlock = stderrLines.join('\n');
+    expect(stderrBlock).toContain('Interrupted (SIGINT)');
+    expect(stderrBlock).toContain('billing');
+    expect(stderrBlock).toContain('testsprite test wait run_abc');
+  });
+
+  it('SIG-3: SIGTERM maps to exit 143', async () => {
+    const { credentialsPath } = makeCreds();
+    const shutdown = new ShutdownController();
+    const pending = runTestWait(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 600,
+      },
+      {
+        credentialsPath,
+        fetchImpl: hangingFetch(),
+        stdout: () => {},
+        stderr: () => {},
+        sleep: instantSleep,
+        shutdown,
+      },
+    );
+    setTimeout(() => shutdown.interrupt('SIGTERM'), 5);
+    const err = await pending.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect((err as InterruptError).exitCode).toBe(143);
+  });
+
+  it('arms the shutdown scope during the wait and disarms after a terminal result', async () => {
+    const { credentialsPath } = makeCreds();
+    const shutdown = new ShutdownController();
+    const fetchImpl = makeFetch(() => ({ body: makeRun('passed') }));
+    await runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: () => {},
+        sleep: instantSleep,
+        shutdown,
+      },
+    );
+    expect(shutdown.isArmed).toBe(false); // disarmed after the poll completes
   });
 });

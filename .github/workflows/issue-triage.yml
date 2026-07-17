@@ -31,10 +31,18 @@ env:
 
 jobs:
   triage:
+    # Public repo only — this file also lives in the private mirror (atlas),
+    # where issue-first claiming doesn't apply; the three sibling bots
+    # (pr-triage.yml, ci-nudge.yml, stale.yml) all carry this same fence and
+    # this one was missing it (found in the 2026-07-15 OSS-P2 audit — the
+    # /assign bot was live on atlas too until this fix).
     # issues only (issue_comment also fires on PRs), and never react to a bot's own
     # comment — incl. our own testsprite-hob[bot], which (unlike GITHUB_TOKEN) would
     # otherwise re-trigger this workflow. `type == 'Bot'` covers both bot identities.
-    if: ${{ !github.event.issue.pull_request && github.event.comment.user.type != 'Bot' }}
+    if: >-
+      github.repository == 'TestSprite/testsprite-cli' &&
+      !github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot'
     runs-on: ubuntu-latest
     steps:
       # Mint a token for the testsprite-hob App so comments post as testsprite-hob[bot].
@@ -49,7 +57,7 @@ jobs:
           # of inheriting the App's full installation permissions.
           permission-issues: write
 
-      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.0.1
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           # App token when available (→ testsprite-hob[bot]); else the default
           # GITHUB_TOKEN (→ github-actions[bot]). Either way the logic is identical.

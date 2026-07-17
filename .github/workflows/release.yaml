@@ -14,13 +14,33 @@ jobs:
         with:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
-      # npm trusted publishing (OIDC) requires npm >= 11.5.1; Node 22 bundles npm 10.x
-      - run: npm install -g npm@latest
+      # npm trusted publishing (OIDC) requires npm >= 11.5.1; Node 22 never bundles
+      # that (it ships 10.9.x). Pin an EXACT version rather than floating on
+      # @latest: npm 12.0.0 shipped with a broken workspace symlink that pulled the
+      # wrong `sigstore` dependency into its own release tarball, so every
+      # `npm publish --provenance` failed with `Cannot find module 'sigstore'`
+      # (npm/cli#9722) — this is exactly what our v0.2.0 and v0.3.0 release.yaml
+      # runs hit, both AFTER `npm install -g npm@latest` reported success. Fixed
+      # in 12.0.1 (2026-07-10); bump this pin deliberately, never float it again.
+      - run: npm install -g npm@11.6.2
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
       - run: npm run format:check
       - run: npm run test:coverage
       - run: npm run build
-      # Auth via npm trusted publishing (OIDC) — no token needed; provenance is implied
-      - run: npm publish --provenance --access public
+      # Auth via npm trusted publishing (OIDC) — no token needed; provenance is
+      # implied. A prerelease tag (e.g. v0.3.0-rc.1, contains "-") must publish
+      # under an explicit dist-tag: current npm already refuses an implicit
+      # `latest` for a prerelease version, but failing mid-release is worse than
+      # not needing the guard, so this still passes --tag itself rather than
+      # relying on that enforcement alone.
+      - name: Publish
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$REF_NAME" == *-* ]]; then
+            npm publish --provenance --access public --tag next
+          else
+            npm publish --provenance --access public
+          fi

@@ -21,7 +21,8 @@
  *  Deadline exceeded → throw `TimeoutError`.
  */
 
-import { ApiError } from './errors.js';
+import { ApiError, InterruptError } from './errors.js';
+import type { ShutdownHandle } from './interrupt.js';
 import type { RunResponse } from './runs.types.js';
 import { isTerminalStatus } from './runs.types.js';
 
@@ -89,6 +90,16 @@ export interface PollOptions {
     elapsedMs: number,
     signal: AbortSignal,
   ) => Promise<RunResponse | null>;
+  /**
+   * Graceful-detach coordinator (DEV-331 piece 1). While the poll runs, the
+   * scope is armed: a SIGINT/SIGTERM aborts `shutdown.signal` with an
+   * `InterruptError` instead of killing the process, and this loop surfaces
+   * it immediately — the in-flight long-poll fetch aborts (composed into the
+   * per-iteration signal) and every backoff/retry sleep bails early. The
+   * caller's catch block renders the honest partial + re-attach hint.
+   * Absent (tests, non-wait callers): behavior is unchanged.
+   */
+  shutdown?: ShutdownHandle;
 }
 
 const LONG_POLL_WAIT_SECONDS = 25;
@@ -109,8 +120,29 @@ export async function pollRunUntilTerminal(
   runId: string,
   options: PollOptions,
 ): Promise<RunResponse> {
+  // Arm the graceful-detach scope for the duration of the poll (DEV-331):
+  // while armed, a termination signal aborts instead of hard-killing the
+  // process, and the wait-path catch blocks own the honest detach UX.
+  const disarm = options.shutdown?.arm();
+  try {
+    return await pollLoop(client, runId, options);
+  } finally {
+    disarm?.();
+  }
+}
+
+async function pollLoop(
+  client: RunClient,
+  runId: string,
+  options: PollOptions,
+): Promise<RunResponse> {
   const { timeoutSeconds, onTick, onTransition, resolveAlternate } = options;
-  const sleep = options.sleep ?? defaultSleep;
+  const shutdownSignal = options.shutdown?.signal;
+  const rawSleep = options.sleep ?? defaultSleep;
+  // Every sleep site (retryAfterSeconds, backoff schedule, not_yet_visible,
+  // 5xx retry) bails immediately on interrupt — a Ctrl-C must not sit out a
+  // 15s backoff before it is noticed.
+  const sleep = (ms: number): Promise<void> => sleepUnlessInterrupted(rawSleep, ms, shutdownSignal);
 
   const startMs = Date.now();
   const deadlineMs = startMs + timeoutSeconds * 1000;
@@ -123,6 +155,9 @@ export async function pollRunUntilTerminal(
   let notYetVisibleRetries = 0;
 
   while (true) {
+    // Interrupt outranks the deadline: a Ctrl-C that raced the timeout must
+    // surface as the honest detach, not as a generic TimeoutError.
+    if (shutdownSignal?.aborted) throw shutdownSignal.reason;
     const now = Date.now();
     if (now >= deadlineMs) {
       throw new TimeoutError(runId, timeoutSeconds);
@@ -139,20 +174,33 @@ export async function pollRunUntilTerminal(
     const abortTimer = setTimeout(() => {
       abortController.abort();
     }, remainingMs + TRANSPORT_CUSHION_MS);
+    // Compose the interrupt into the per-iteration signal: a `--wait` can sit
+    // inside one <=25s long-poll fetch (and the auto-raised per-request
+    // timeout means even longer for slow backends) — checking the flag
+    // between iterations is not enough, the in-flight fetch must abort.
+    const iterationSignal =
+      shutdownSignal != null
+        ? AbortSignal.any([abortController.signal, shutdownSignal])
+        : abortController.signal;
 
     let run: RunResponse;
     try {
       if (useBackoff) {
-        run = await client.getRun(runId, { signal: abortController.signal });
+        run = await client.getRun(runId, { signal: iterationSignal });
       } else {
         const waitSeconds = Math.min(remainingSeconds, LONG_POLL_WAIT_SECONDS);
-        run = await client.getRun(runId, { waitSeconds, signal: abortController.signal });
+        run = await client.getRun(runId, { waitSeconds, signal: iterationSignal });
       }
       // Successful GET resets the consecutive-error counter.
       consecutiveErrors = 0;
       notYetVisibleRetries = 0;
     } catch (err) {
       clearTimeout(abortTimer);
+      // Interrupt classification precedes the timeout mapping: the composed
+      // signal makes the fetch reject on Ctrl-C, and that abort must surface
+      // as the InterruptError — not as a spurious TimeoutError.
+      if (err instanceof InterruptError) throw err;
+      if (shutdownSignal?.aborted) throw shutdownSignal.reason;
       // An AbortError from our per-iteration controller means the deadline
       // passed while the fetch was in flight — surface as TimeoutError.
       if (isAbortError(err)) {
@@ -239,9 +287,16 @@ export async function pollRunUntilTerminal(
       }
       const altAbort = new AbortController();
       const altTimer = setTimeout(() => altAbort.abort(), altRemainingMs);
+      // The alternate lookup aborts on interrupt too; its errors are swallowed
+      // by the fallback (best-effort), so the loop-top interrupt check above
+      // surfaces the InterruptError on the next iteration.
+      const altSignal =
+        shutdownSignal != null
+          ? AbortSignal.any([altAbort.signal, shutdownSignal])
+          : altAbort.signal;
       let alternate: RunResponse | null = null;
       try {
-        alternate = await resolveAlternate(run, elapsedMs, altAbort.signal);
+        alternate = await resolveAlternate(run, elapsedMs, altSignal);
       } finally {
         clearTimeout(altTimer);
       }
@@ -292,6 +347,36 @@ function backoffScheduleDelay(index: number): number {
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Race a sleep against the shutdown signal: rejects with the signal's
+ * `InterruptError` reason the moment it fires, so no backoff/retry wait can
+ * delay the honest-detach UX. Wraps the injected `sleep` (tests keep their
+ * deterministic fakes); the underlying timer is left to fire harmlessly —
+ * the interrupt path exits the process long before it matters.
+ */
+function sleepUnlessInterrupted(
+  sleep: (ms: number) => Promise<void>,
+  ms: number,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (signal == null) return sleep(ms);
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    sleep(ms).then(
+      () => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      },
+      err => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
 }
 
 /**

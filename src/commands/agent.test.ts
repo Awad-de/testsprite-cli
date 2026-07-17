@@ -1108,75 +1108,87 @@ describe('runInstall — default AgentFs (real disk)', () => {
     expect(readFileSync(abs, 'utf8')).toBe(content);
   });
 
-  it('refuses to write through a symlinked parent dir (real disk) — exit 5', async () => {
-    const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-parent-'));
-    const outside = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-'));
-    // `.claude` is a real symlink to a directory outside the project root.
-    symlinkSync(outside, path.join(tmpRoot, '.claude'), 'dir');
-    const { deps } = makeCapture();
+  // `fs.symlinkSync` needs elevated privileges or Developer Mode on Windows
+  // (EPERM otherwise) — not guaranteed on hosted CI runners. The underlying
+  // guard (`inspectTargetPath` fail-closing via `lstat`) is exercised on
+  // POSIX runners; TODO(DEV-356): revisit if/when a reliable Windows
+  // symlink-creation path (junctions, or an elevated runner) is available.
+  it.skipIf(process.platform === 'win32')(
+    'refuses to write through a symlinked parent dir (real disk) — exit 5',
+    async () => {
+      const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-parent-'));
+      const outside = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-'));
+      // `.claude` is a real symlink to a directory outside the project root.
+      symlinkSync(outside, path.join(tmpRoot, '.claude'), 'dir');
+      const { deps } = makeCapture();
 
-    let thrown: unknown;
-    try {
-      await runInstall(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          dryRun: false,
-          target: ['claude'],
-          skills: ['testsprite-verify'],
-          force: false,
-          dir: tmpRoot,
-        },
-        { ...deps },
-      );
-    } catch (err) {
-      thrown = err;
-    }
+      let thrown: unknown;
+      try {
+        await runInstall(
+          {
+            profile: 'default',
+            output: 'text',
+            debug: false,
+            dryRun: false,
+            target: ['claude'],
+            skills: ['testsprite-verify'],
+            force: false,
+            dir: tmpRoot,
+          },
+          { ...deps },
+        );
+      } catch (err) {
+        thrown = err;
+      }
 
-    expect(thrown).toBeInstanceOf(CLIError);
-    expect((thrown as CLIError).exitCode).toBe(5);
-    // Nothing was created through the symlink, outside --dir.
-    expect(existsSync(path.join(outside, 'skills'))).toBe(false);
-  });
+      expect(thrown).toBeInstanceOf(CLIError);
+      expect((thrown as CLIError).exitCode).toBe(5);
+      // Nothing was created through the symlink, outside --dir.
+      expect(existsSync(path.join(outside, 'skills'))).toBe(false);
+    },
+  );
 
-  it('refuses to overwrite a symlinked target file (real disk) with --force — exit 5', async () => {
-    const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-target-'));
-    const outsideDir = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-target-'));
-    const { path: relPath } = renderForTarget('claude', 'testsprite-verify');
-    const abs = path.resolve(tmpRoot, relPath);
-    const nodeFs = await import('node:fs/promises');
-    await nodeFs.mkdir(path.dirname(abs), { recursive: true });
-    // SKILL.md is a real symlink to a file outside the project root.
-    const outsideFile = path.join(outsideDir, 'secret.txt');
-    await nodeFs.writeFile(outsideFile, 'SECRET', 'utf8');
-    symlinkSync(outsideFile, abs, 'file');
-    const { deps } = makeCapture();
+  // Same Windows symlink-privilege caveat as the test above.
+  it.skipIf(process.platform === 'win32')(
+    'refuses to overwrite a symlinked target file (real disk) with --force — exit 5',
+    async () => {
+      const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-target-'));
+      const outsideDir = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-target-'));
+      const { path: relPath } = renderForTarget('claude', 'testsprite-verify');
+      const abs = path.resolve(tmpRoot, relPath);
+      const nodeFs = await import('node:fs/promises');
+      await nodeFs.mkdir(path.dirname(abs), { recursive: true });
+      // SKILL.md is a real symlink to a file outside the project root.
+      const outsideFile = path.join(outsideDir, 'secret.txt');
+      await nodeFs.writeFile(outsideFile, 'SECRET', 'utf8');
+      symlinkSync(outsideFile, abs, 'file');
+      const { deps } = makeCapture();
 
-    let thrown: unknown;
-    try {
-      await runInstall(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          dryRun: false,
-          target: ['claude'],
-          skills: ['testsprite-verify'],
-          force: true,
-          dir: tmpRoot,
-        },
-        { ...deps },
-      );
-    } catch (err) {
-      thrown = err;
-    }
+      let thrown: unknown;
+      try {
+        await runInstall(
+          {
+            profile: 'default',
+            output: 'text',
+            debug: false,
+            dryRun: false,
+            target: ['claude'],
+            skills: ['testsprite-verify'],
+            force: true,
+            dir: tmpRoot,
+          },
+          { ...deps },
+        );
+      } catch (err) {
+        thrown = err;
+      }
 
-    expect(thrown).toBeInstanceOf(CLIError);
-    expect((thrown as CLIError).exitCode).toBe(5);
-    // The outside file was NOT overwritten (nor clobbered via the .bak path).
-    expect(readFileSync(outsideFile, 'utf8')).toBe('SECRET');
-  });
+      expect(thrown).toBeInstanceOf(CLIError);
+      expect((thrown as CLIError).exitCode).toBe(5);
+      // The outside file was NOT overwritten (nor clobbered via the .bak path).
+      expect(readFileSync(outsideFile, 'utf8')).toBe('SECRET');
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -2036,12 +2048,12 @@ describe('[P3 round-2] codex --dry-run: composed-size precision + read-failure s
     const { capture, deps } = makeCapture();
     const agentsAbs = path.resolve(CWD, TARGETS.codex.path);
 
-    // Old managed section with a 6 KiB body + 26 KiB of user prose.
-    // existing (~32.9 KiB) + new section (~4.8 KiB) > 32 KiB → the OLD formula
-    // would warn; the composed replace result (26 KiB + new section) is
-    // comfortably under budget → no warn expected.
+    // Old managed section with a 6 KiB body + 25 KiB of user prose.
+    // existing (~31.9 KiB) + new section (~6.2 KiB: verify codex body +
+    // onboard aggregate) > 32 KiB → the OLD formula would warn; the composed
+    // replace result (25 KiB + new section) is under budget → no warn expected.
     const oldSection = `${MANAGED_SECTION_BEGIN}\n${'o'.repeat(6 * 1024)}\n${MANAGED_SECTION_END}\n`;
-    const userProse = `# My own AGENTS.md\n${'u'.repeat(26 * 1024)}\n`;
+    const userProse = `# My own AGENTS.md\n${'u'.repeat(25 * 1024)}\n`;
     seedFile(agentsAbs, `${userProse}\n${oldSection}`);
 
     await runInstall({ ...BASE_OPTS_DRY, target: ['codex'] }, { cwd: CWD, fs: agentFs, ...deps });

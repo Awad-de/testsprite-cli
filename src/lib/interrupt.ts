@@ -19,22 +19,100 @@
  * without spawning a subprocess or sending a real signal.
  */
 
+import { setMaxListeners } from 'node:events';
 import { writeSync } from 'node:fs';
+import { InterruptError, TERMINATION_EXIT_CODES, type TerminationSignal } from './errors.js';
 
-/**
- * Termination signals handled, mapped to their conventional `128 + signum`
- * exit code. sourceRef: POSIX signal numbers (SIGHUP=1, SIGINT=2, SIGTERM=15).
- */
-export const TERMINATION_EXIT_CODES = {
-  SIGINT: 130, // 128 + 2
-  SIGTERM: 143, // 128 + 15
-  SIGHUP: 129, // 128 + 1
-} as const;
-
-export type TerminationSignal = keyof typeof TERMINATION_EXIT_CODES;
+export { TERMINATION_EXIT_CODES, type TerminationSignal } from './errors.js';
 
 /** Back-compat alias: SIGINT's conventional exit code. */
 export const SIGINT_EXIT_CODE = TERMINATION_EXIT_CODES.SIGINT;
+
+/**
+ * Structural view of {@link ShutdownController} threaded through the DI
+ * surfaces (`TestDeps`, `PollOptions`) — commands and the polling loop need
+ * only these members, and tests can supply a lightweight fake.
+ */
+export interface ShutdownHandle {
+  /** Aborts (reason: `InterruptError`) when a termination signal arrives while armed. */
+  readonly signal: AbortSignal;
+  /** Enter a graceful-detach scope. Returns the disposer that leaves it. */
+  arm(): () => void;
+}
+
+/**
+ * Process-lifetime coordinator between the signal handler and the `--wait`
+ * polling paths (DEV-331 piece 1).
+ *
+ * Two modes, chosen by whether a graceful-detach scope is armed when the
+ * signal arrives:
+ *
+ * - **Armed** (inside `pollRunUntilTerminal`): the handler only aborts
+ *   `signal` with an `InterruptError` — no I/O, no exit. The in-flight fetch
+ *   and every backoff sleep bail immediately; the `--wait` catch blocks own
+ *   the cleanup (finalize the ticker, print the honest partial envelope +
+ *   re-attach hint, rethrow to `index.ts` → exit 130/143/129).
+ * - **Disarmed** (no wait in progress — prompts, one-shot commands, local
+ *   FS work): the handler prints the generic explanation and exits
+ *   immediately, preserving the pre-DEV-331 behavior. An abort nobody
+ *   observes must never leave the process hanging at e.g. a readline prompt.
+ *
+ * A second signal while the armed cleanup is in flight is the documented
+ * escape hatch: immediate hard exit.
+ */
+export class ShutdownController {
+  private readonly controller = new AbortController();
+  private armedCount = 0;
+  private receivedSignal: TerminationSignal | null = null;
+
+  constructor() {
+    // Every fetch and every poll iteration composes this signal via
+    // AbortSignal.any — a 50-run batch fan-out legitimately holds >10
+    // concurrent listeners, so silence Node's MaxListeners warning.
+    setMaxListeners(0, this.controller.signal);
+  }
+
+  get signal(): AbortSignal {
+    return this.controller.signal;
+  }
+
+  /** The first termination signal received, or null if none yet. */
+  get received(): TerminationSignal | null {
+    return this.receivedSignal;
+  }
+
+  get isArmed(): boolean {
+    return this.armedCount > 0;
+  }
+
+  /**
+   * Enter a graceful-detach scope (re-entrant: fan-out members overlap).
+   * Returns an idempotent disposer.
+   */
+  arm(): () => void {
+    this.armedCount += 1;
+    let disposed = false;
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      this.armedCount -= 1;
+    };
+  }
+
+  /** Record the signal and abort with an `InterruptError` carrying it. */
+  interrupt(signal: TerminationSignal): void {
+    this.receivedSignal = signal;
+    this.controller.abort(new InterruptError(signal));
+  }
+}
+
+/**
+ * The process-wide instance: `index.ts` hands it to `installSignalHandlers`,
+ * and it is the default `shutdown` for `TestDeps` / `PollOptions` /
+ * `ClientFactoryDeps`, so production wiring is automatic. Tests inject their
+ * own `ShutdownController` (or a `ShutdownHandle` fake) instead.
+ */
+export const globalShutdown = new ShutdownController();
 
 export function formatInterruptMessage(signal: TerminationSignal = 'SIGINT'): string {
   return (
@@ -50,11 +128,19 @@ export interface InterruptDeps {
   stderr?: (line: string) => void;
   /** Process exit. Defaults to `process.exit`. */
   exit?: (code: number) => void;
+  /** Shutdown coordinator. Defaults to {@link globalShutdown}. */
+  shutdown?: ShutdownController;
 }
 
 /**
  * Register handlers for SIGINT, SIGTERM and SIGHUP. Idempotent enough for a
  * single top-level call in `index.ts`; not designed to be installed twice.
+ *
+ * First signal, armed scope: abort-only — the `--wait` catch paths own the
+ * honest-detach UX and the exit (DEV-331 D1: Ctrl-C = detach, never cancel).
+ * First signal, disarmed: print the generic explanation + exit `128+signum`.
+ * Second signal (any mode): immediate hard exit — the escape hatch when the
+ * graceful cleanup itself wedges.
  */
 export function installSignalHandlers(deps: InterruptDeps = {}): void {
   const on =
@@ -75,9 +161,27 @@ export function installSignalHandlers(deps: InterruptDeps = {}): void {
       }
     });
   const exit = deps.exit ?? ((code: number) => process.exit(code));
+  const shutdown = deps.shutdown ?? globalShutdown;
 
   for (const signal of Object.keys(TERMINATION_EXIT_CODES) as TerminationSignal[]) {
     on(signal, () => {
+      if (shutdown.received !== null) {
+        // Second signal while graceful cleanup is in flight: hard exit now.
+        exit(TERMINATION_EXIT_CODES[signal]);
+        return;
+      }
+      if (shutdown.isArmed) {
+        // Graceful detach: abort only (sync, signal-safe — no I/O here so a
+        // pending stdout `drain` wait can settle); the armed catch paths
+        // finalize the ticker, print the partial + re-attach hint, and exit
+        // via index.ts with this signal's code.
+        shutdown.interrupt(signal);
+        return;
+      }
+      // Disarmed (no --wait in progress): legacy immediate exit. Record the
+      // signal first so a second one takes the hard-exit branch even when
+      // `exit` is injected and does not terminate (unit tests).
+      shutdown.interrupt(signal);
       // Blank line first so the message starts on its own row rather than
       // trailing the progress ticker's in-place line.
       stderr('');

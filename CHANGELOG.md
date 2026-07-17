@@ -4,6 +4,27 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-16
+
+### Added
+
+- **`test cancel <run-id...>`** — user-initiated cancel of in-flight runs (the real stop button; Ctrl-C only detaches). A single id renders the run card with status `cancelled` (plus an advisory when it was already cancelled); multiple ids print a `{cancelled, alreadyCancelled, conflicts, notFound}` summary. Exit codes: 4 when any id is not found, else 6 on conflicts, else 0. `--dry-run` supported.
+- **Graceful Ctrl-C during `--wait`** — SIGINT/SIGTERM now detaches cleanly instead of killing the process mid-poll: the in-flight request aborts immediately, stdout gets the same partial `{runId, status: "running"}` envelope as the request-timeout path, and stderr states the truth — the server-side run keeps executing (and billing) — with a re-attach hint and a `test cancel` pointer. Exit 130/143/129 per the documented signal contract; a second signal forces a hard exit. Interrupting never cancels the server-side run — that's what `test cancel` is for.
+- **`project delete <project-id> --confirm`** — permanently delete a project and everything under it (its frontend/backend sub-projects, all their tests, and backend fixtures), mirroring the Portal's cascade delete. Requires `--confirm` (the CLI never prompts); `--dry-run` previews the response shape without a network call. Standard exit codes: 0 success, 3 auth, 4 not-found (or already-deleted), 5 validation (e.g. missing `--confirm`).
+- **Backend stdout and traceback in results** — `test result` and the failure bundle now surface the backend test's captured stdout and Python traceback: full content in `--output json` (and in `result.json` / `failure.json` bundle files), and a bounded 20-line tail with a byte count in text mode. No change for frontend tests, passing runs, or older backends.
+- **Backend dependency declarations are now readable and editable** — `test get` surfaces `produces` / `consumes` / `category`, and `test update` accepts `--produces` / `--needs` / `--category` (previously create-only).
+- **Version-compatibility handshake** — the CLI reads the backend's advertised minimum-supported-version on every response and prints a one-line upgrade advisory on stderr when the running version is below the floor (honors the same opt-outs as the update notice; never alters exit status). A `CLIENT_TOO_OLD` rejection (HTTP 426) is now a first-class error: exit 14, non-retriable, rendered with upgrade guidance and the version gap.
+- **V3 routing visibility** — `auth status` and `doctor` render a `routing: v2|v3` line when the backend reports the account's routing, and V3-routed accounts get one consolidated advisory listing the known V3-path behavior gaps. Text mode only — JSON consumers read `v3Enabled` from the `/me` payload; absent-safe against older backends.
+
+### Changed
+
+- **The `testsprite-verify` agent skill routes local-only changes to the TestSprite MCP** — the skill now states the reachability gate explicitly: the CLI verifies reachable deployed URLs only; when the change is only running locally, the skill hands off to the TestSprite MCP when available (an explicitly named tool always wins), instead of failing against localhost.
+
+### Fixed
+
+- **`project create --description` now fails fast with a clear validation error** — projects have no description field, so the flag's value was previously dropped silently; the error points at test-level descriptions (`test create --description`) instead.
+- **Standalone backend run cards no longer show a misleading step summary** — `test run` / `test wait` / `test rerun` cards for backend tests render `steps: n/a (backend)` instead of `0/0 (passed=0, failed=0)` (backend tests have no per-step storage).
+
 ## [0.3.0] - 2026-07-08
 
 ### Added

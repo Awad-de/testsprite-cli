@@ -110,7 +110,8 @@ export interface CliCreateProjectRequest {
   type: 'frontend' | 'backend';
   name: string;
   targetUrl?: string;
-  description?: string;
+  // `description` is intentionally not part of the wire request — projects have
+  // no description field. The `--description` flag is rejected client-side.
   username?: string;
   password?: string;
   instruction?: string;
@@ -154,8 +155,13 @@ export async function runCreate(
   if (opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
   }
-  if (opts.description !== undefined && opts.description.length > 2000) {
-    throw localValidationError('--description must be at most 2000 characters');
+  // `--description` is not supported on projects — no project entity stores a
+  // description, and the backend rejects it with a 422. Fail fast client-side
+  // with an actionable message instead of a wasted round trip.
+  if (opts.description !== undefined) {
+    throw localValidationError(
+      '--description is not supported for projects; omit it (test-level descriptions are set on `test create`)',
+    );
   }
 
   // P2-7: guard --url against localhost/RFC1918/non-http(s) (same rules as
@@ -210,7 +216,6 @@ export async function runCreate(
     type: opts.type,
     name: opts.name,
     ...(opts.targetUrl !== undefined ? { targetUrl: opts.targetUrl } : {}),
-    ...(opts.description !== undefined ? { description: opts.description } : {}),
     ...(opts.username !== undefined ? { username: opts.username } : {}),
     ...(password !== undefined ? { password } : {}),
     ...(opts.instruction !== undefined ? { instruction: opts.instruction } : {}),
@@ -344,6 +349,80 @@ export async function runUpdate(
 
   out.print(updated, data => renderUpdateText(data as CliUpdateProjectResponse));
   return updated;
+}
+
+// ---------------------------------------------------------------------------
+// project delete
+// ---------------------------------------------------------------------------
+
+export interface CliDeleteProjectResponse {
+  projectId: string;
+  deletedAt: string;
+}
+
+interface DeleteOptions extends CommonOptions {
+  projectId: string;
+  /** Hard gate — required (unless `--dry-run` is set). No interactive prompts. */
+  confirm: boolean;
+  /** Caller-supplied idempotency token; UUIDv4 minted client-side if absent. */
+  idempotencyKey?: string;
+}
+
+/**
+ * `project delete <project-id> --confirm` — permanent cascade delete via
+ * DELETE /projects/{id}.
+ *
+ * The server deletes the project together with everything under it — its
+ * frontend/backend sub-projects, all their tests, and backend fixtures —
+ * matching the Portal's own delete behavior. There is no restore window.
+ *
+ * **`--confirm` is required** (unless `--dry-run`). Without either, the CLI
+ * exits 5 `VALIDATION_ERROR` with a typed envelope explaining the convention.
+ * The CLI never prompts interactively (CI-friendly contract). Re-delete on an already-deleted (or missing) project returns 404 from
+ * the server; the CLI surfaces the envelope as-is (exit 4), no client branching.
+ */
+export async function runDelete(
+  opts: DeleteOptions,
+  deps: ProjectDeps = {},
+): Promise<CliDeleteProjectResponse> {
+  assertIdempotencyKey(opts.idempotencyKey);
+  if (opts.projectId === undefined || opts.projectId.trim().length === 0) {
+    throw localValidationError('<project-id> is required');
+  }
+
+  if (!opts.confirm && !opts.dryRun) {
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Refusing to delete without --confirm.',
+        nextAction:
+          'This permanently deletes the project and everything under it — its ' +
+          'sub-projects, all their tests, and backend fixtures (no restore window). ' +
+          'The CLI convention is explicit confirmation for destructive operations. ' +
+          'Re-run with --confirm. (--dry-run also works without --confirm.)',
+        requestId: 'local',
+        details: { field: 'confirm', reason: 'required for destructive operation' },
+      },
+    });
+  }
+
+  const idempotencyKey = opts.idempotencyKey ?? `cli-delete-${randomUUID()}`;
+  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
+    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    stderr(`idempotency-key: ${idempotencyKey}`);
+  }
+
+  const client = makeClient(opts, deps);
+  const out = makeOutput(opts.output, deps);
+  const response = await client.delete<CliDeleteProjectResponse>(
+    `/projects/${encodeURIComponent(opts.projectId)}`,
+    {
+      headers: { 'idempotency-key': idempotencyKey },
+    },
+  );
+
+  out.print(response, data => renderDeleteText(data as CliDeleteProjectResponse));
+  return response;
 }
 
 // ---------------------------------------------------------------------------
@@ -616,7 +695,10 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .option('--type <frontend|backend>', 'project type (required)')
     .option('--name <name>', 'project name (required)')
     .option('--url <url>', 'target URL (required for frontend)')
-    .option('--description <text>', 'optional human description')
+    .option(
+      '--description <text>',
+      'not supported — projects have no description (test-level descriptions are set on `test create`)',
+    )
     .option('--username <user>', 'optional auth username')
     .option('--password <pw>', 'optional auth password (use --password-file for non-interactive)')
     .option('--password-file <path>', 'read password from file instead of inline flag')
@@ -678,6 +760,35 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
           password: cmdOpts.password,
           passwordFile: cmdOpts.passwordFile,
           instruction: cmdOpts.instruction,
+          idempotencyKey: cmdOpts.idempotencyKey,
+        },
+        deps,
+      );
+    });
+
+  project
+    .command('delete <project-id>')
+    .description(
+      'Permanently delete a project and everything under it (sub-projects,\n' +
+        'their tests, and backend fixtures). Requires --confirm.\n' +
+        '\nExit codes:\n' +
+        '  0  success\n' +
+        '  3  auth error\n' +
+        '  4  project not found (or already deleted)\n' +
+        '  5  validation error (e.g., missing --confirm)',
+    )
+    .option('--confirm', 'required: explicit confirmation for the destructive operation', false)
+    .option(
+      '--idempotency-key <token>',
+      'opaque idempotency token. Defaults to a UUIDv4 minted per invocation.',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (projectId: string, cmdOpts: DeleteFlagOpts, command: Command) => {
+      await runDelete(
+        {
+          ...resolveCommonOptions(command),
+          projectId,
+          confirm: cmdOpts.confirm === true,
           idempotencyKey: cmdOpts.idempotencyKey,
         },
         deps,
@@ -805,6 +916,11 @@ interface UpdateFlagOpts {
   password?: string;
   passwordFile?: string;
   instruction?: string;
+  idempotencyKey?: string;
+}
+
+interface DeleteFlagOpts {
+  confirm?: boolean;
   idempotencyKey?: string;
 }
 
@@ -950,6 +1066,10 @@ function renderUpdateText(r: CliUpdateProjectResponse): string {
     `updatedFields: ${r.updatedFields?.join(', ') ?? '(none)'}`,
     `updatedAt:     ${r.updatedAt}`,
   ].join('\n');
+}
+
+function renderDeleteText(r: CliDeleteProjectResponse): string {
+  return [`projectId ${r.projectId}`, `deletedAt ${r.deletedAt}`].join('\n');
 }
 
 function localValidationError(message: string): ApiError {

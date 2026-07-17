@@ -225,6 +225,20 @@ export interface RunResponse {
   steps?: RunStepDto[] | null;
 }
 
+// ---------------------------------------------------------------------------
+// DEV-331 piece 3 — cancel wire types
+// ---------------------------------------------------------------------------
+
+/**
+ * Response from `POST /api/cli/v1/runs/{runId}/cancel`.
+ * Same shape as `GET /runs/{runId}` (`status: "cancelled"`, verdict
+ * untouched) plus `alreadyCancelled` distinguishing a fresh cancel
+ * (naturally idempotent) from a no-op re-cancel.
+ */
+export interface CancelRunResponse extends RunResponse {
+  alreadyCancelled: boolean;
+}
+
 /** Terminal states from the RunStatus union. */
 export const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set([
   'passed',

@@ -12,7 +12,7 @@ import {
 import { createProjectCommand } from './commands/project.js';
 import { createTestCommand } from './commands/test.js';
 import { createUsageCommand } from './commands/usage.js';
-import { ApiError, CLIError, RequestTimeoutError } from './lib/errors.js';
+import { ApiError, CLIError, InterruptError, RequestTimeoutError } from './lib/errors.js';
 import { installBrokenPipeGuard, installSignalHandlers } from './lib/interrupt.js';
 import { Output, isOutputMode } from './lib/output.js';
 import { maybeInstallProxyAgent } from './lib/proxy.js';
@@ -164,9 +164,12 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
   }
 });
 
-// Clean process lifecycle: a clear message + conventional exit code on SIGINT /
-// SIGTERM / SIGHUP (instead of Node's silent abrupt kill) so an interrupted
-// `test run --wait` explains the run continues server-side; plus an EPIPE guard
+// Clean process lifecycle (DEV-331 piece 1, errors.md §8.1): during a `--wait`
+// poll the scope is armed — the first SIGINT/SIGTERM/SIGHUP aborts gracefully
+// and the wait path prints an honest partial (the run KEEPS executing and
+// billing server-side) + re-attach hint before exiting 128+signum; a second
+// signal hard-exits. Outside an armed scope: a clear one-line message +
+// immediate exit (instead of Node's silent abrupt kill). Plus an EPIPE guard
 // so piping to a reader that closes early (`| head`) exits cleanly instead of
 // dumping a raw `write EPIPE` stack.
 installSignalHandlers();
@@ -209,10 +212,44 @@ try {
           process.stderr.write(`  granted:  ${(granted as string[]).join(', ')}\n`);
         }
       }
+      // Surface the version gap on CLIENT_TOO_OLD so the user sees exactly what
+      // moved without parsing the message string. (No "latest" line — the npm
+      // update-notice is the single source of truth for the newest release.)
+      if (err.code === 'CLIENT_TOO_OLD') {
+        const your = err.getDetail('yourVersion');
+        const min = err.getDetail('minVersion');
+        if (typeof your === 'string' && typeof min === 'string') {
+          process.stderr.write(`  your version: ${your}, minimum supported: ${min}\n`);
+        }
+      }
     }
     process.exit(err.exitCode);
   }
   const output = new Output(mode);
+  if (err instanceof InterruptError) {
+    // Graceful detach (DEV-331 piece 1, errors.md §8.1): the wait-path catch
+    // block already printed the honest partial + re-attach hint. Exit with
+    // the conventional 128+signum code; `INTERRUPTED` is deliberately outside
+    // the error catalog. Note: Ctrl-C does NOT cancel the server-side run.
+    if (mode === 'json') {
+      const envelope = {
+        error: {
+          code: 'INTERRUPTED',
+          message: err.message,
+          nextAction:
+            'The server-side run (if any) keeps executing and billing. ' +
+            'Re-attach with: testsprite test wait <runId>, or stop it with: testsprite test cancel <runId> ' +
+            '(runId is in the partial JSON on stdout).',
+          requestId: 'local',
+          details: { signal: err.signal },
+        },
+      };
+      process.stderr.write(`${JSON.stringify(envelope, null, 2)}\n`);
+    } else {
+      process.stderr.write(`Error: ${err.message}\n`);
+    }
+    process.exit(err.exitCode);
+  }
   if (err instanceof RequestTimeoutError) {
     // Structured rendering for per-request timeouts: JSON mode emits a
     // machine-readable envelope; text mode emits the message with a hint.

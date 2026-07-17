@@ -19,4 +19,23 @@ regexes = [
   '''sk-secret-[0-9]+''',
   # Documented placeholder keys used by dry-run/sample responses
   '''sk-user-(test|DRY-RUN)''',
+  # Example values inside internal (never-shipped, dropped-before-publish)
+  # design docs. These are only ever scanned by ci.yml's continuous gitleaks
+  # job (new, 2026-07) — the release-time scan
+  # (scripts/make-public-snapshot.sh) already drops those internal docs
+  # wholesale before it ever runs gitleaks, so these never previously
+  # tripped a scan. Deliberately described here without naming the internal
+  # doc paths themselves (this file ships to the public repo, and the
+  # snapshot's own internal-doc-reference scan would flag such a path).
+  # A "Bearer <token>" curl example whose placeholder token literal is the
+  # word "dev-token" — not a real key. (Allowlist regexes match against the
+  # extracted secret value, not the surrounding line — verified empirically
+  # with `gitleaks detect`.)
+  '''^dev-token$''',
+  # A literal base64 pagination-cursor EXAMPLE value in an internal OpenAPI
+  # spec (decodes to {"ek":"project_a47b2c11"} — spec-example data, not a
+  # credential). Anchored ^…$ so it only ever matches this exact literal —
+  # an unanchored version would also suppress any REAL secret that happens
+  # to contain this substring (review round 2, 2026-07-15; reproduced).
+  '''^eyJlayI6InByb2plY3RfYTQ3YjJjMTEifQ==$''',
 ]

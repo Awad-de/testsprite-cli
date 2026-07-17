@@ -21,6 +21,17 @@ Run the loop only once the change is live somewhere reachable (e.g. open the PR,
 let CI deploy the preview/staging environment) and pass that URL as
 `--target-url`. Running earlier verifies the previous build, not your change.
 
+This CLI only tests a reachable deployed URL (it rejects localhost). If the
+change is only running locally and isn't deployed anywhere reachable yet:
+
+- if the TestSprite MCP is available in this environment, hand off to it — it
+  tunnels your local server and tests the running app;
+- otherwise report the change as unverified-because-undeployed and stop — don't
+  run against a stale deployment to manufacture a verdict.
+
+If the user explicitly named a tool (the CLI or the MCP), honor that over this
+reachability heuristic.
+
 ## When to skip
 
 The skip list is narrow:
@@ -225,10 +236,10 @@ testsprite test create --type backend --project <projectId> --name "fixture user
   ordering: trigger the set with `test run --all` (§4) and producers run before
   consumers, `teardown` last. Chaining `run A --wait && run B --wait` yourself
   loses the engine's variable passing and conflicts with concurrent runs.
-- **Declarations are currently create-only.** `test update` cannot amend them and
-  `test get` / `test list` don't echo them back, so note what each test
-  produces/needs as you create it; changing the graph later means delete +
-  recreate.
+- **Declarations are editable.** `test update` amends them (`--produces` /
+  `--needs` / `--category`, repeatable) and `test get` echoes them back —
+  still declare the graph at create time when you can, so wave ordering is
+  right on the first run.
 
 **Show the user the drafted plan / code before creating it** — creating writes to
 their project. One short confirmation; let them edit the tempfile first.

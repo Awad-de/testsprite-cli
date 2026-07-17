@@ -45,6 +45,12 @@ export const ERROR_CODES = [
   // so the CLI can drop the client-side detection heuristic.
   'FEATURE_GATED',
   'UNSUPPORTED',
+  // The running CLI is older than the backend's minimum supported version.
+  // Backend emits this as HTTP 426 when version enforcement is enabled. Exit
+  // 14, non-retriable — a too-old client cannot self-heal by retrying; the
+  // user must upgrade. `nextAction` carries the upgrade instruction and
+  // `details` echoes { minVersion, latestVersion, yourVersion }.
+  'CLIENT_TOO_OLD',
   'INTERNAL',
   'UNAVAILABLE',
 ] as const;
@@ -77,6 +83,8 @@ export function exitCodeFor(code: ErrorCode): number {
       return 6;
     case 'UNSUPPORTED':
       return 7;
+    case 'CLIENT_TOO_OLD':
+      return 14;
     case 'UNAVAILABLE':
       return 10;
     case 'RATE_LIMITED':
@@ -97,6 +105,41 @@ export class CLIError extends Error {
     super(message);
     this.name = 'CLIError';
     this.exitCode = exitCode;
+  }
+}
+
+/**
+ * Termination signals with graceful handling, mapped to their conventional
+ * `128 + signum` exit code. sourceRef: POSIX signal numbers (SIGHUP=1,
+ * SIGINT=2, SIGTERM=15). Lives here (not interrupt.ts) so `InterruptError`
+ * needs no import cycle; `interrupt.ts` re-exports for back-compat.
+ */
+export const TERMINATION_EXIT_CODES = {
+  SIGINT: 130, // 128 + 2
+  SIGTERM: 143, // 128 + 15
+  SIGHUP: 129, // 128 + 1
+} as const;
+
+export type TerminationSignal = keyof typeof TERMINATION_EXIT_CODES;
+
+/**
+ * User-initiated interrupt (SIGINT/SIGTERM/SIGHUP) observed while a
+ * graceful-detach scope (the `--wait` polling window) was armed — see
+ * `interrupt.ts::ShutdownController`. The `--wait` catch blocks render the
+ * honest partial envelope + re-attach hint, then rethrow to `index.ts`.
+ *
+ * Deliberately NOT in `ERROR_CODES` — on a signal the CLI
+ * exits 130/143 without consulting the error catalog. The JSON-mode stderr
+ * envelope uses the out-of-catalog code `"INTERRUPTED"`. Same client-local
+ * synthetic category as `RequestTimeoutError`.
+ */
+export class InterruptError extends CLIError {
+  readonly signal: TerminationSignal;
+
+  constructor(signal: TerminationSignal) {
+    super(`Interrupted by ${signal}.`, TERMINATION_EXIT_CODES[signal]);
+    this.name = 'InterruptError';
+    this.signal = signal;
   }
 }
 
@@ -314,6 +357,8 @@ function codeFromHttpStatus(status: number | undefined): ErrorCode {
       return 'PRECONDITION_FAILED';
     case 413:
       return 'PAYLOAD_TOO_LARGE';
+    case 426:
+      return 'CLIENT_TOO_OLD';
     case 429:
       return 'RATE_LIMITED';
     case 501:
