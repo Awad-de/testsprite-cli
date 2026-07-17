@@ -22,11 +22,11 @@ unverified-because-undeployed and stop. If the user explicitly named a tool
 
 ```bash
 testsprite --version          # CLI installed?
-testsprite auth whoami        # credentials valid?
+testsprite auth status        # credentials valid?
 ```
 
 If `--version` fails, tell the user to install the CLI and stop.
-If `auth whoami` fails, tell the user to run `testsprite auth configure` and stop.
+If `auth status` fails, tell the user to run `testsprite setup` and stop.
 
 ### 2. Find the project
 
