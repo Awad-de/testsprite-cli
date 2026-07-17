@@ -487,6 +487,7 @@ export class HttpClient {
 
     const url = buildUrl(this.baseUrl, path, options.query);
     const requestId = options.requestId ?? newRequestId();
+    const allowTransportRetry = canRetryTransport(method, options);
 
     let attempt = 0;
     while (true) {
@@ -557,7 +558,9 @@ export class HttpClient {
             errorCode: 'TRANSPORT',
             durationMs: Date.now() - startedAt,
           });
-          const decision = transportRetryDecision(attempt, this.random);
+          const decision = allowTransportRetry
+            ? transportRetryDecision(attempt, this.random)
+            : { retry: false, delayMs: 0 };
           if (!decision.retry) throw new TransportError(message, requestId);
           this.transition(
             `Network error on ${shortPath(path)} — retrying in ${Math.round(decision.delayMs / 1000)}s (attempt ${attempt})`,
@@ -635,7 +638,9 @@ export class HttpClient {
             errorCode: 'TRANSPORT',
             durationMs,
           });
-          const decision = transportRetryDecision(attempt, this.random);
+          const decision = allowTransportRetry
+            ? transportRetryDecision(attempt, this.random)
+            : { retry: false, delayMs: 0 };
           if (!decision.retry) {
             throw new TransportError(`HTTP ${response.status} from ${url}`, requestId);
           }
@@ -943,6 +948,20 @@ interface RetryDecision {
 function transportRetryDecision(attempt: number, random: () => number): RetryDecision {
   if (attempt >= MAX_ATTEMPTS_TRANSPORT) return { retry: false, delayMs: 0 };
   return { retry: true, delayMs: backoffDelay(attempt, random) };
+}
+
+function canRetryTransport(method: string, options: RequestOptions): boolean {
+  return isIdempotentMethod(method) || hasIdempotencyKey(options.headers);
+}
+
+function isIdempotentMethod(method: string): boolean {
+  const normalized = method.toUpperCase();
+  return normalized === 'GET' || normalized === 'HEAD';
+}
+
+function hasIdempotencyKey(headers: Record<string, string> | undefined): boolean {
+  if (!headers) return false;
+  return Object.keys(headers).some(name => name.toLowerCase() === 'idempotency-key');
 }
 
 function apiRetryDecision(
