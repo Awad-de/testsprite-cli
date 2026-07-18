@@ -16,7 +16,11 @@
  * If the CLI OpenAPI spec changes, both this file AND
  * `test/mock-backend/fixtures.ts` must be updated in the same PR.
  */
-import type { CliProject, CliUpdateProjectResponse } from '../../commands/project.js';
+import type {
+  CliProject,
+  CliUpdateProjectResponse,
+  CliDeleteProjectResponse,
+} from '../../commands/project.js';
 import type {
   CliBulkDeleteSummary,
   CliFailureContext,
@@ -27,6 +31,7 @@ import type {
   CliTestStep,
 } from '../../commands/test.js';
 import type { MeResponse } from '../../commands/auth.js';
+import { buildJUnitReport } from '../junit-report.js';
 import type { Page } from '../pagination.js';
 import type {
   TriggerRunResponse,
@@ -35,6 +40,7 @@ import type {
   BatchRerunResponse,
   BatchRunFreshResponse,
   ListRunsResponse,
+  CancelRunResponse,
 } from '../runs.types.js';
 
 const SAMPLE_USER_ID = '11111111-1111-4111-8111-111111111111';
@@ -67,11 +73,43 @@ const SAMPLE_REQUEST_ID = 'req_dry-run';
 
 export const SAMPLE_DRY_RUN_REQUEST_ID = SAMPLE_REQUEST_ID;
 
+/**
+ * Canned JUnit XML for batch `--wait --report junit --dry-run`. Mirrors the
+ * fresh batch-run sample ids so agents can learn the sidecar shape offline.
+ */
+export function sampleJUnitReportXml(
+  projectId: string = SAMPLE_PROJECT_ID,
+  reportSuiteName?: string,
+): string {
+  return buildJUnitReport({
+    suiteName: reportSuiteName ?? `testsprite:${projectId}`,
+    classname: projectId,
+    results: [
+      {
+        testId: SAMPLE_TEST_ID_FRESH_1,
+        runId: SAMPLE_BATCH_FRESH_RUN_ID_1,
+        status: 'passed',
+      },
+      {
+        testId: SAMPLE_TEST_ID_FRESH_2,
+        runId: SAMPLE_BATCH_FRESH_RUN_ID_2,
+        status: 'failed',
+        error: {
+          code: 'ASSERTION',
+          message: 'Expected checkout heading to be visible',
+          exitCode: 1,
+        },
+      },
+    ],
+  });
+}
+
 const me: MeResponse = {
   userId: SAMPLE_USER_ID,
   keyId: SAMPLE_KEY_ID,
   scopes: ['read:projects', 'read:tests', 'write:tests', 'run:tests'],
   env: 'development',
+  v3Enabled: true,
 };
 
 const projects: CliProject[] = [
@@ -365,6 +403,11 @@ const ENTRIES: DryRunSampleEntry[] = [
     updatedFields: ['name'],
     updatedAt: '2026-05-16T00:00:00.000Z',
   } satisfies CliUpdateProjectResponse),
+  // DELETE /projects/{id} (cascade delete project + tests + fixtures).
+  entry('deleteProject', 'DELETE', '/projects/{projectId}', {
+    projectId: SAMPLE_PROJECT_ID,
+    deletedAt: '2026-05-16T00:00:00.000Z',
+  } satisfies CliDeleteProjectResponse),
   entry('listTests', 'GET', '/tests', pageOf(tests)),
   entry('getTestCode', 'GET', '/tests/{testId}/code', testCode),
   entry('listTestSteps', 'GET', '/tests/{testId}/steps', pageOf(testSteps)),
@@ -715,6 +758,36 @@ const ENTRIES: DryRunSampleEntry[] = [
       },
     ],
   } satisfies RunResponse),
+  // DEV-331 piece 3 — POST /runs/{runId}/cancel. Method-guarded in
+  // `findSample` (POST vs `getRun`'s GET), so this can't be shadowed by the
+  // broader `/runs/{runId}` pattern above despite sharing its path prefix.
+  // `alreadyCancelled: false` — a fresh cancel is the more instructive shape
+  // for a dry-run learner than the idempotent no-op.
+  entry('cancelRun', 'POST', '/runs/{runId}/cancel', {
+    runId: SAMPLE_RUN_ID,
+    testId: SAMPLE_TEST_ID_PASSED,
+    projectId: SAMPLE_PROJECT_ID,
+    userId: SAMPLE_USER_ID,
+    status: 'cancelled',
+    source: 'cli',
+    createdAt: '2026-05-15T19:32:00.000Z',
+    startedAt: '2026-05-15T19:32:05.000Z',
+    finishedAt: '2026-05-15T19:33:12.000Z',
+    codeVersion: 'v1',
+    targetUrl: SAMPLE_TARGET_URL,
+    createdFrom: null,
+    failedStepIndex: null,
+    failureKind: null,
+    error: null,
+    videoUrl: null,
+    stepSummary: {
+      total: 8,
+      completed: 3,
+      passedCount: 3,
+      failedCount: 0,
+    },
+    alreadyCancelled: false,
+  } satisfies CancelRunResponse),
 ];
 
 function entry(

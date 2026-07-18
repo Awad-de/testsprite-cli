@@ -50,6 +50,21 @@ export interface ResolverOptions {
    * Each page uses pageSize=50, so 5 pages = 250 tests scanned.
    */
   maxPages?: number;
+  /**
+   * DEV-393: the operator's pinned `failingFrontendTestId` (the static value
+   * from fixtures.local.json). "Freshest failed" alone is fragile in a shared
+   * project: any OTHER FE test that fails more recently than a dedicated,
+   * permanently-red fixture silently steals the slot (live-reproduced
+   * 2026-07-16 — a `passingFrontendTestId` fresh-run flip immediately
+   * outranked the dedicated fixture on `updatedAt`). When set, the pinned id
+   * is probed directly first (one GET /tests/{id} — immune to the maxPages
+   * list-scan cap); if it is currently `status:failed` it wins outright,
+   * regardless of timestamp. If the probe errors, the list scan below still
+   * prefers the pinned id when it appears among the candidates. Falls through
+   * to the existing freshest-wins behavior when unset or no longer failing —
+   * fully backward compatible.
+   */
+  preferredId?: string;
 }
 
 export interface ResolverResult {
@@ -67,8 +82,45 @@ export interface ResolverResult {
  * when no Failed test exists — never throws.
  */
 export async function resolveFailingFrontendTestId(opts: ResolverOptions): Promise<ResolverResult> {
-  const { baseUrl, apiKey, projectId, maxPages = 5 } = opts;
+  const { baseUrl, apiKey, projectId, maxPages = 5, preferredId } = opts;
   const fetchImpl = opts.fetchImpl ?? fetch;
+
+  // DEV-393 (codex F3): probe the pinned fixture directly first, so the
+  // preference cannot be defeated by the maxPages list-scan cap (a pinned
+  // fixture beyond page `maxPages` would otherwise silently lose the slot to
+  // an incidental fresher failure). Any probe error or non-failed status
+  // falls through to the list scan; the in-candidates preference there
+  // remains as a second chance after a transient probe failure.
+  if (preferredId) {
+    try {
+      const resp = await fetchImpl(`${baseUrl}/tests/${encodeURIComponent(preferredId)}`, {
+        headers: {
+          'x-api-key': apiKey,
+          'x-request-id': `dev-e2e-resolver-preferred-${Date.now()}`,
+          accept: 'application/json',
+        },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (resp.ok) {
+        const test = (await resp.json()) as Partial<TestListItem> & { projectId?: string };
+        // The probe must honor the resolver's project scope (codex round 2):
+        // the list path filters by projectId server-side, so a pin that
+        // points at a failed FE test in a DIFFERENT project must not win
+        // here either. A response without a matching projectId (absent or
+        // mismatched) falls through to the project-scoped list scan.
+        if (test.type === 'frontend' && test.status === 'failed' && test.projectId === projectId) {
+          return {
+            testId: preferredId,
+            reason:
+              `Preferred pinned failingFrontendTestId (${preferredId}) confirmed status:failed ` +
+              `via direct GET (updatedAt=${test.updatedAt ?? 'unknown'}); list scan skipped`,
+          };
+        }
+      }
+    } catch {
+      // Transient probe failure — fall through to the list scan below.
+    }
+  }
 
   const candidates: TestListItem[] = [];
   let cursor: string | undefined;
@@ -132,6 +184,19 @@ export async function resolveFailingFrontendTestId(opts: ResolverOptions): Promi
       reason:
         'No frontend tests with status=failed found in project; falling back to static fixture',
     };
+  }
+
+  // DEV-393: a pinned, dedicated "always red" fixture wins over freshest
+  // whenever it is still in the failed set — see the doc comment on
+  // ResolverOptions.preferredId for why "freshest" alone is not enough.
+  if (preferredId) {
+    const pinned = candidates.find(c => c.id === preferredId);
+    if (pinned) {
+      return {
+        testId: pinned.id,
+        reason: `Preferred pinned failingFrontendTestId (${pinned.id}) is still status:failed (updatedAt=${pinned.updatedAt}); took priority over freshest-updatedAt candidate`,
+      };
+    }
   }
 
   // Pick the most recently updated candidate — freshest failure is the

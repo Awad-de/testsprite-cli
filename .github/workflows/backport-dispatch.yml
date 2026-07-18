@@ -1,0 +1,83 @@
+# backport-dispatch.yml — OPTIONAL latency optimization for DEV-352's
+# auto-backport bot. Authored in atlas (release/public path), ships to the
+# PUBLIC repo via the snapshot per invariant I0 — this workflow only ever
+# runs on the public repo, never on atlas (see the repo guard below).
+#
+# NOT YET ARMED (2026-07-15): the atlas-side auto-backport.yml has a
+# scheduled SWEEP (every 30 min) that scans merged public PRs anonymously
+# and backports anything unabsorbed — the whole pipeline is fully
+# functional with ZERO public-repo credentials via that path alone. This
+# workflow instantly notifies atlas the moment a PR merges instead of
+# waiting for the next sweep (seconds vs. up to 30 minutes) — a nice-to-have,
+# not a requirement.
+#
+# Arming it means placing a GitHub App credential with contents:write on
+# the PRIVATE atlas repo into THIS PUBLIC repo's secrets — a real trust
+# decision (a compromised public-repo secret store would let an attacker
+# push to atlas) that is deliberately left to the operator, not decided by
+# this file. Until TESTSPRITE_HOB_APP_ID/TESTSPRITE_HOB_PRIVATE_KEY (or the
+# ALFHEIM_AGENT_* fallback) exist on the PUBLIC repo with contents:write on
+# atlas, this workflow no-ops cleanly (see the "not armed" step) — it does
+# NOT fail loud, so it stays quiet for every contributor watching the
+# Actions tab until the operator decides to enable it.
+#
+# SECURITY: this workflow reads ONLY event metadata (PR number, merge SHA,
+# base ref) — it never checks out the merged PR's code. That is what makes
+# `pull_request_target` safe here: the base-repo context (secrets, a
+# write-capable token) is required because a fork-originated merged PR gets
+# ZERO secrets under a plain `pull_request` trigger, even for the `closed`
+# activity type — but nothing in this job ever runs untrusted fork code, so
+# the classic pull_request_target RCE/secret-exfiltration risk (checking
+# out and executing the fork's own head ref under a privileged context)
+# does not apply. Do not add actions/checkout to this workflow.
+name: Notify atlas of a merged public PR
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    if: github.repository == 'TestSprite/testsprite-cli' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.TESTSPRITE_HOB_APP_ID || secrets.ALFHEIM_AGENT_APP_ID }}
+          private-key: ${{ secrets.TESTSPRITE_HOB_PRIVATE_KEY || secrets.ALFHEIM_AGENT_PRIVATE_KEY }}
+          owner: TestSprite
+          repositories: testsprite-cli-atlas
+          # Minimum required for POST /repos/{owner}/{repo}/dispatches (verified
+          # against docs.github.com/en/rest/using-the-rest-api/permissions-required-for-github-apps —
+          # the endpoint is gated on Contents:write, not Contents:read).
+          permission-contents: write
+
+      - name: Dispatch to atlas
+        if: steps.app-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # These two fields are fork-influenced (merge_commit_sha/base.ref come
+          # from a merged PR's event payload) — routed through env instead of
+          # spliced into the run: string to avoid the GHA script-injection class
+          # (a maliciously-crafted value could otherwise break out of the -F
+          # argument and inject arbitrary shell). PR_NUMBER is left inline: it is
+          # a GitHub-assigned integer, not attacker-authorable content.
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          gh api repos/TestSprite/testsprite-cli-atlas/dispatches \
+            -f event_type=public-pr-merged \
+            -F 'client_payload[pr_number]=${{ github.event.pull_request.number }}' \
+            -F "client_payload[merge_commit_sha]=$MERGE_SHA" \
+            -F "client_payload[base_ref]=$BASE_REF"
+
+      - name: Not armed yet — the atlas sweep will pick this up
+        if: steps.app-token.outputs.token == ''
+        run: |
+          echo "::notice::No cross-repo credential configured on this repo yet — atlas's scheduled sweep (auto-backport.yml, every 30 min) will pick up this merge instead of an instant dispatch. See DEV-352 / DEV-348 / DEV-350 for the operator decision to arm this."

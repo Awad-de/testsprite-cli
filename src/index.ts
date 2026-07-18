@@ -1,7 +1,10 @@
 #!/usr/bin/env node
+
 import { Command, CommanderError } from 'commander';
 import { createAgentCommand } from './commands/agent.js';
 import { createAuthCommand } from './commands/auth.js';
+import { createCompletionCommand, type CompletionSpec } from './commands/completion.js';
+import { createDoctorCommand } from './commands/doctor.js';
 import {
   createDeprecatedInitCommand,
   createSetupCommand,
@@ -10,11 +13,24 @@ import {
 import { createProjectCommand } from './commands/project.js';
 import { createTestCommand } from './commands/test.js';
 import { createUsageCommand } from './commands/usage.js';
-import { ApiError, CLIError, RequestTimeoutError } from './lib/errors.js';
+import { ApiError, CLIError, InterruptError, RequestTimeoutError } from './lib/errors.js';
+import { installBrokenPipeGuard, installSignalHandlers } from './lib/interrupt.js';
 import { Output, isOutputMode } from './lib/output.js';
+import { maybeInstallProxyAgent } from './lib/proxy.js';
 import { renderCommanderError, rephraseUnknownOption } from './lib/render-error.js';
 import { maybeEmitSkillNudge } from './lib/skill-nudge.js';
+import { maybeNotifyUpdate } from './lib/update-check.js';
 import { VERSION } from './version.js';
+import { shouldRejectNodeVersion } from './version-guard.js';
+
+// Guard: exit early with a clear message on unsupported Node.js versions,
+// rather than failing later with a cryptic ESM/runtime error.
+if (shouldRejectNodeVersion(process.versions.node)) {
+  process.stderr.write(
+    `Error: testsprite requires Node.js >= 20 (found ${process.versions.node}).\nInstall the latest LTS from https://nodejs.org\n`,
+  );
+  process.exit(1);
+}
 
 const program = new Command();
 
@@ -37,7 +53,7 @@ program
   .option('--debug', 'Print HTTP method/path, request id, latency, retry decisions to stderr')
   .option(
     '--dry-run',
-    'Skip the network, credentials, and filesystem; emit a canned sample matching the OpenAPI contract. Useful for learning the CLI surface without an API key.',
+    'Skip the network and credentials; emit a canned sample matching the OpenAPI contract. Useful for learning the CLI surface without an API key. Note: file inputs you pass (--plan-from/--plans/--steps) are still read and validated locally; only --code-file uses a placeholder.',
   )
   .option(
     '--request-timeout <seconds>',
@@ -76,6 +92,29 @@ program.addCommand(createProjectCommand({}));
 program.addCommand(createTestCommand());
 program.addCommand(createAgentCommand({}));
 program.addCommand(createUsageCommand());
+program.addCommand(createDoctorCommand());
+program.addCommand(createCompletionCommand(() => buildCompletionSpec()));
+
+// Derive the shell-completion spec from the fully-assembled command tree at call
+// time (not module-load), so `testsprite completion` can never drift from the
+// real commands, subcommands, and global flags.
+function buildCompletionSpec(): CompletionSpec {
+  const subcommands: Record<string, string[]> = {};
+  for (const command of program.commands) {
+    const subs = command.commands.map(sub => sub.name()).filter(name => name !== 'help');
+    if (subs.length > 0) subcommands[command.name()] = subs;
+  }
+  const flags = program.options
+    .map(option => option.long)
+    .filter((long): long is string => typeof long === 'string');
+  if (!flags.includes('--help')) flags.push('--help');
+  return {
+    program: 'testsprite',
+    commands: [...new Set([...program.commands.map(command => command.name()), 'help'])],
+    subcommands,
+    globalFlags: flags,
+  };
+}
 
 // Buffer Commander error messages instead of writing immediately. The catch
 // block re-emits in the correct format (JSON or text) once the requested
@@ -128,15 +167,40 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     profile?: string;
     dryRun?: boolean;
   };
+  const commandPath = commandPathOf(actionCommand);
   maybeEmitSkillNudge({
-    commandPath: commandPathOf(actionCommand),
+    commandPath,
     output: isOutputMode(globals.output) ? globals.output : 'text',
     dryRun: globals.dryRun ?? false,
     profile: globals.profile ?? 'default',
     cwd: process.cwd(),
     env: process.env,
   });
+
+  // Best-effort update notice (see lib/update-check.ts): self-gates on the
+  // opt-out env, CI, TTY, and a 24h cache; the wiring adds the flag-level
+  // gates the lib cannot see. Skipped for `completion` (its stdout is eval'd
+  // by shells), under --output json, and under --dry-run. Deliberately not
+  // awaited: an advisory must never delay the real command.
+  if (globals.output !== 'json' && globals.dryRun !== true && commandPath !== 'completion') {
+    void maybeNotifyUpdate();
+  }
 });
+
+// Clean process lifecycle (DEV-331 piece 1, errors.md §8.1): during a `--wait`
+// poll the scope is armed — the first SIGINT/SIGTERM/SIGHUP aborts gracefully
+// and the wait path prints an honest partial (the run KEEPS executing and
+// billing server-side) + re-attach hint before exiting 128+signum; a second
+// signal hard-exits. Outside an armed scope: a clear one-line message +
+// immediate exit (instead of Node's silent abrupt kill). Plus an EPIPE guard
+// so piping to a reader that closes early (`| head`) exits cleanly instead of
+// dumping a raw `write EPIPE` stack.
+installSignalHandlers();
+installBrokenPipeGuard();
+
+// Corporate/CI proxies: honor HTTPS_PROXY/HTTP_PROXY/NO_PROXY (Node's fetch
+// ignores them by default). No-op when no proxy variable is set.
+maybeInstallProxyAgent();
 
 try {
   await program.parseAsync(process.argv);
@@ -171,10 +235,44 @@ try {
           process.stderr.write(`  granted:  ${(granted as string[]).join(', ')}\n`);
         }
       }
+      // Surface the version gap on CLIENT_TOO_OLD so the user sees exactly what
+      // moved without parsing the message string. (No "latest" line — the npm
+      // update-notice is the single source of truth for the newest release.)
+      if (err.code === 'CLIENT_TOO_OLD') {
+        const your = err.getDetail('yourVersion');
+        const min = err.getDetail('minVersion');
+        if (typeof your === 'string' && typeof min === 'string') {
+          process.stderr.write(`  your version: ${your}, minimum supported: ${min}\n`);
+        }
+      }
     }
     process.exit(err.exitCode);
   }
   const output = new Output(mode);
+  if (err instanceof InterruptError) {
+    // Graceful detach (DEV-331 piece 1, errors.md §8.1): the wait-path catch
+    // block already printed the honest partial + re-attach hint. Exit with
+    // the conventional 128+signum code; `INTERRUPTED` is deliberately outside
+    // the error catalog. Note: Ctrl-C does NOT cancel the server-side run.
+    if (mode === 'json') {
+      const envelope = {
+        error: {
+          code: 'INTERRUPTED',
+          message: err.message,
+          nextAction:
+            'The server-side run (if any) keeps executing and billing. ' +
+            'Re-attach with: testsprite test wait <runId>, or stop it with: testsprite test cancel <runId> ' +
+            '(runId is in the partial JSON on stdout).',
+          requestId: 'local',
+          details: { signal: err.signal },
+        },
+      };
+      process.stderr.write(`${JSON.stringify(envelope, null, 2)}\n`);
+    } else {
+      process.stderr.write(`Error: ${err.message}\n`);
+    }
+    process.exit(err.exitCode);
+  }
   if (err instanceof RequestTimeoutError) {
     // Structured rendering for per-request timeouts: JSON mode emits a
     // machine-readable envelope; text mode emits the message with a hint.

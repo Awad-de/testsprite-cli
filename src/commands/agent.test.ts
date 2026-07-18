@@ -9,13 +9,21 @@ import {
   MANAGED_SECTION_END,
   ONBOARD_CODEX_LINE,
   SKILLS,
+  buildSkillMarker,
   pathFor,
   renderForTarget,
+  renderOwnFileWithMarker,
   TARGETS,
   type AgentTarget,
 } from '../lib/agent-targets.js';
-import type { AgentDeps, AgentFs, InstallResult, ListResult } from './agent.js';
-import { AGENTS_MD_CODEX_BUDGET_BYTES, createAgentCommand, runInstall, runList } from './agent.js';
+import type { AgentDeps, AgentFs, InstallResult, ListResult, StatusResult } from './agent.js';
+import {
+  AGENTS_MD_CODEX_BUDGET_BYTES,
+  createAgentCommand,
+  runInstall,
+  runList,
+  runStatus,
+} from './agent.js';
 
 // ---------------------------------------------------------------------------
 // In-memory AgentFs backed by a Map
@@ -653,29 +661,39 @@ describe('runInstall — multi-target', () => {
 // ---------------------------------------------------------------------------
 
 describe('runInstall — empty target', () => {
-  it('non-TTY with no target throws exit 5', async () => {
-    const { fs: agentFs } = makeMemFs();
+  it('non-TTY with no target defaults to claude and installs the skill file', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        target: [],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
+    );
+
+    const claudeAbs = path.resolve(CWD, TARGETS.claude.path);
+    expect(store.has(claudeAbs)).toBe(true);
+    expect(capture.stderr.join('\n')).toContain('defaulting to claude');
+  });
+
+  it('non-TTY default writes the canonical claude content', async () => {
+    const { store, fs: agentFs } = makeMemFs();
     const { deps } = makeCapture();
 
-    let thrown: unknown;
-    try {
-      await runInstall(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          dryRun: false,
-          target: [],
-          force: false,
-        },
-        { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
-      );
-    } catch (err) {
-      thrown = err;
-    }
+    await runInstall(
+      { profile: 'default', output: 'text', debug: false, dryRun: false, target: [], force: false },
+      { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
+    );
 
-    expect(thrown).toBeInstanceOf(ApiError);
-    expect((thrown as ApiError).exitCode).toBe(5);
+    const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
+    const abs = path.resolve(CWD, relPath);
+    expect(store.get(abs)).toBe(content);
   });
 
   it('TTY with injected prompt returning "claude" installs claude', async () => {
@@ -741,6 +759,7 @@ describe('runList', () => {
     expect(out).toContain('cursor');
     expect(out).toContain('cline');
     expect(out).toContain('antigravity');
+    expect(out).toContain('kiro');
     expect(out).toContain('codex');
     expect(out).toContain('ga');
     expect(out).toContain('experimental');
@@ -749,6 +768,7 @@ describe('runList', () => {
     expect(out).toContain(TARGETS.cursor.path);
     expect(out).toContain(TARGETS.cline.path);
     expect(out).toContain(TARGETS.antigravity.path);
+    expect(out).toContain(TARGETS.kiro.path);
     expect(out).toContain(TARGETS.codex.path);
   });
 
@@ -759,13 +779,16 @@ describe('runList', () => {
 
     const json = JSON.parse(capture.stdout.join('\n')) as ListResult[];
     expect(Array.isArray(json)).toBe(true);
-    // 5 targets × 2 default skills = 10 rows
-    expect(json).toHaveLength(10);
+    // 8 targets × 2 default skills = 16 rows
+    expect(json).toHaveLength(16);
     const targets = json.map(r => r.target);
     expect(targets).toContain('claude');
     expect(targets).toContain('cursor');
     expect(targets).toContain('cline');
+    expect(targets).toContain('windsurf');
+    expect(targets).toContain('copilot');
     expect(targets).toContain('antigravity');
+    expect(targets).toContain('kiro');
     expect(targets).toContain('codex');
     // skill field present on each row
     const skills = json.map(r => r.skill);
@@ -905,11 +928,11 @@ describe('createAgentCommand wiring', () => {
 });
 
 // ---------------------------------------------------------------------------
-// All four own-file targets installed at once
+// All own-file targets installed at once
 // ---------------------------------------------------------------------------
 
-describe('runInstall — all four own-file targets', () => {
-  it('installs all four own-file targets in one invocation', async () => {
+describe('runInstall — all own-file targets', () => {
+  it('installs every own-file target in one invocation', async () => {
     const { store, fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -919,7 +942,7 @@ describe('runInstall — all four own-file targets', () => {
         output: 'text',
         debug: false,
         dryRun: false,
-        target: ['claude', 'cursor', 'cline', 'antigravity'],
+        target: [...OWN_FILE_TARGETS],
         skills: ['testsprite-verify'],
         force: false,
       },
@@ -937,11 +960,11 @@ describe('runInstall — all four own-file targets', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Dry-run for all four own-file targets
+// Dry-run for all seven own-file targets
 // ---------------------------------------------------------------------------
 
 describe('runInstall — dry-run all own-file targets', () => {
-  it('writes nothing for any of the four own-file targets (default 2 skills = 8 would-write lines)', async () => {
+  it('writes nothing for any of the seven own-file targets (default 2 skills = 14 would-write lines)', async () => {
     const { store, fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -951,7 +974,7 @@ describe('runInstall — dry-run all own-file targets', () => {
         output: 'text',
         debug: false,
         dryRun: true,
-        target: ['claude', 'cursor', 'cline', 'antigravity'],
+        target: ['claude', 'cursor', 'cline', 'antigravity', 'kiro', 'windsurf', 'copilot'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -961,9 +984,9 @@ describe('runInstall — dry-run all own-file targets', () => {
     const stderrOut = capture.stderr.join('\n');
     // Banner appears once
     expect(stderrOut).toContain('[dry-run] no files written');
-    // 4 targets × 2 default skills = 8 would-write lines
+    // 7 targets × 2 default skills = 14 would-write lines
     const wouldWriteLines = stderrOut.split('\n').filter(l => l.includes('would write'));
-    expect(wouldWriteLines.length).toBe(8);
+    expect(wouldWriteLines.length).toBe(14);
   });
 });
 
@@ -1085,75 +1108,87 @@ describe('runInstall — default AgentFs (real disk)', () => {
     expect(readFileSync(abs, 'utf8')).toBe(content);
   });
 
-  it('refuses to write through a symlinked parent dir (real disk) — exit 5', async () => {
-    const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-parent-'));
-    const outside = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-'));
-    // `.claude` is a real symlink to a directory outside the project root.
-    symlinkSync(outside, path.join(tmpRoot, '.claude'), 'dir');
-    const { deps } = makeCapture();
+  // `fs.symlinkSync` needs elevated privileges or Developer Mode on Windows
+  // (EPERM otherwise) — not guaranteed on hosted CI runners. The underlying
+  // guard (`inspectTargetPath` fail-closing via `lstat`) is exercised on
+  // POSIX runners; TODO(DEV-356): revisit if/when a reliable Windows
+  // symlink-creation path (junctions, or an elevated runner) is available.
+  it.skipIf(process.platform === 'win32')(
+    'refuses to write through a symlinked parent dir (real disk) — exit 5',
+    async () => {
+      const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-parent-'));
+      const outside = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-'));
+      // `.claude` is a real symlink to a directory outside the project root.
+      symlinkSync(outside, path.join(tmpRoot, '.claude'), 'dir');
+      const { deps } = makeCapture();
 
-    let thrown: unknown;
-    try {
-      await runInstall(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          dryRun: false,
-          target: ['claude'],
-          skills: ['testsprite-verify'],
-          force: false,
-          dir: tmpRoot,
-        },
-        { ...deps },
-      );
-    } catch (err) {
-      thrown = err;
-    }
+      let thrown: unknown;
+      try {
+        await runInstall(
+          {
+            profile: 'default',
+            output: 'text',
+            debug: false,
+            dryRun: false,
+            target: ['claude'],
+            skills: ['testsprite-verify'],
+            force: false,
+            dir: tmpRoot,
+          },
+          { ...deps },
+        );
+      } catch (err) {
+        thrown = err;
+      }
 
-    expect(thrown).toBeInstanceOf(CLIError);
-    expect((thrown as CLIError).exitCode).toBe(5);
-    // Nothing was created through the symlink, outside --dir.
-    expect(existsSync(path.join(outside, 'skills'))).toBe(false);
-  });
+      expect(thrown).toBeInstanceOf(CLIError);
+      expect((thrown as CLIError).exitCode).toBe(5);
+      // Nothing was created through the symlink, outside --dir.
+      expect(existsSync(path.join(outside, 'skills'))).toBe(false);
+    },
+  );
 
-  it('refuses to overwrite a symlinked target file (real disk) with --force — exit 5', async () => {
-    const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-target-'));
-    const outsideDir = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-target-'));
-    const { path: relPath } = renderForTarget('claude', 'testsprite-verify');
-    const abs = path.resolve(tmpRoot, relPath);
-    const nodeFs = await import('node:fs/promises');
-    await nodeFs.mkdir(path.dirname(abs), { recursive: true });
-    // SKILL.md is a real symlink to a file outside the project root.
-    const outsideFile = path.join(outsideDir, 'secret.txt');
-    await nodeFs.writeFile(outsideFile, 'SECRET', 'utf8');
-    symlinkSync(outsideFile, abs, 'file');
-    const { deps } = makeCapture();
+  // Same Windows symlink-privilege caveat as the test above.
+  it.skipIf(process.platform === 'win32')(
+    'refuses to overwrite a symlinked target file (real disk) with --force — exit 5',
+    async () => {
+      const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-target-'));
+      const outsideDir = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-target-'));
+      const { path: relPath } = renderForTarget('claude', 'testsprite-verify');
+      const abs = path.resolve(tmpRoot, relPath);
+      const nodeFs = await import('node:fs/promises');
+      await nodeFs.mkdir(path.dirname(abs), { recursive: true });
+      // SKILL.md is a real symlink to a file outside the project root.
+      const outsideFile = path.join(outsideDir, 'secret.txt');
+      await nodeFs.writeFile(outsideFile, 'SECRET', 'utf8');
+      symlinkSync(outsideFile, abs, 'file');
+      const { deps } = makeCapture();
 
-    let thrown: unknown;
-    try {
-      await runInstall(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          dryRun: false,
-          target: ['claude'],
-          skills: ['testsprite-verify'],
-          force: true,
-          dir: tmpRoot,
-        },
-        { ...deps },
-      );
-    } catch (err) {
-      thrown = err;
-    }
+      let thrown: unknown;
+      try {
+        await runInstall(
+          {
+            profile: 'default',
+            output: 'text',
+            debug: false,
+            dryRun: false,
+            target: ['claude'],
+            skills: ['testsprite-verify'],
+            force: true,
+            dir: tmpRoot,
+          },
+          { ...deps },
+        );
+      } catch (err) {
+        thrown = err;
+      }
 
-    expect(thrown).toBeInstanceOf(CLIError);
-    expect((thrown as CLIError).exitCode).toBe(5);
-    // The outside file was NOT overwritten (nor clobbered via the .bak path).
-    expect(readFileSync(outsideFile, 'utf8')).toBe('SECRET');
-  });
+      expect(thrown).toBeInstanceOf(CLIError);
+      expect((thrown as CLIError).exitCode).toBe(5);
+      // The outside file was NOT overwritten (nor clobbered via the .bak path).
+      expect(readFileSync(outsideFile, 'utf8')).toBe('SECRET');
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -1309,6 +1344,50 @@ describe('runInstall — symlink safety', () => {
     expect((thrown as CLIError).exitCode).toBe(5);
     expect((thrown as CLIError).message).toContain('symlink');
     expect(writeCalls.length).toBe(0); // never wrote a .bak nor through the link
+  });
+
+  it('dry-run: refuses (exit 5) when the target file is a symlink (parity with real install)', async () => {
+    const { fs: agentFs, writeCalls, seedSymlink } = makeMemFs();
+    // Same planted SKILL.md symlink as the real-install case above: dry-run
+    // must report the same refusal the real install would, not a success.
+    seedSymlink(path.resolve(CWD, TARGETS.claude.path));
+    const { deps } = makeCapture();
+
+    let thrown: unknown;
+    try {
+      await runInstall(
+        { ...BASE_OPTS, target: ['claude'], force: false, dryRun: true },
+        { cwd: CWD, fs: agentFs, ...deps },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(CLIError);
+    expect((thrown as CLIError).exitCode).toBe(5);
+    expect((thrown as CLIError).message).toContain('symlink');
+    expect(writeCalls.length).toBe(0);
+  });
+
+  it('dry-run: refuses (exit 5) when a parent path component is a symlink', async () => {
+    const { fs: agentFs, writeCalls, seedSymlink } = makeMemFs();
+    seedSymlink(path.resolve(CWD, '.claude'));
+    const { deps } = makeCapture();
+
+    let thrown: unknown;
+    try {
+      await runInstall(
+        { ...BASE_OPTS, target: ['claude'], force: false, dryRun: true },
+        { cwd: CWD, fs: agentFs, ...deps },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(CLIError);
+    expect((thrown as CLIError).exitCode).toBe(5);
+    expect((thrown as CLIError).message).toContain('symlink');
+    expect(writeCalls.length).toBe(0);
   });
 
   it('does not write through a symlinked .bak slot — backs up to a numbered slot', async () => {
@@ -1969,12 +2048,12 @@ describe('[P3 round-2] codex --dry-run: composed-size precision + read-failure s
     const { capture, deps } = makeCapture();
     const agentsAbs = path.resolve(CWD, TARGETS.codex.path);
 
-    // Old managed section with a 6 KiB body + 26 KiB of user prose.
-    // existing (~32.9 KiB) + new section (~4.8 KiB) > 32 KiB → the OLD formula
-    // would warn; the composed replace result (26 KiB + new section) is
-    // comfortably under budget → no warn expected.
+    // Old managed section with a 6 KiB body + 25 KiB of user prose.
+    // existing (~31.9 KiB) + new section (~6.2 KiB: verify codex body +
+    // onboard aggregate) > 32 KiB → the OLD formula would warn; the composed
+    // replace result (25 KiB + new section) is under budget → no warn expected.
     const oldSection = `${MANAGED_SECTION_BEGIN}\n${'o'.repeat(6 * 1024)}\n${MANAGED_SECTION_END}\n`;
-    const userProse = `# My own AGENTS.md\n${'u'.repeat(26 * 1024)}\n`;
+    const userProse = `# My own AGENTS.md\n${'u'.repeat(25 * 1024)}\n`;
     seedFile(agentsAbs, `${userProse}\n${oldSection}`);
 
     await runInstall({ ...BASE_OPTS_DRY, target: ['codex'] }, { cwd: CWD, fs: agentFs, ...deps });
@@ -2381,5 +2460,122 @@ describe('runInstall — SKILLS registry / DEFAULT_SKILLS contract', () => {
   it('ONBOARD_CODEX_LINE is the one-liner used in the codex section', () => {
     expect(typeof ONBOARD_CODEX_LINE).toBe('string');
     expect(ONBOARD_CODEX_LINE).toContain('**First-time setup:**');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runStatus — `agent status` (issue #123)
+// ---------------------------------------------------------------------------
+
+describe('runStatus — agent status (issue #123)', () => {
+  const statusOpts = {
+    profile: 'default' as const,
+    output: 'json' as const,
+    debug: false,
+    dryRun: false,
+  };
+
+  /** Run status against the given fs and return the printed rows. */
+  async function statusRows(agentFs: AgentFs): Promise<{ rows: StatusResult[]; thrown: unknown }> {
+    const { capture, deps } = makeCapture();
+    let thrown: unknown;
+    try {
+      await runStatus(statusOpts, { cwd: CWD, fs: agentFs, ...deps });
+    } catch (err) {
+      thrown = err;
+    }
+    return { rows: JSON.parse(capture.stdout.join('')) as StatusResult[], thrown };
+  }
+
+  it('nothing installed: every row is absent and the command exits 0', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(thrown).toBeUndefined();
+    expect(rows).toHaveLength(Object.keys(TARGETS).length * DEFAULT_SKILLS.length);
+    expect(rows.every(row => row.state === 'absent')).toBe(true);
+  });
+
+  it('fresh installs read ok (own-file and codex managed section), exit 0', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+    await runInstall(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        target: ['claude', 'codex'],
+        skills: [...DEFAULT_SKILLS],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(thrown).toBeUndefined();
+    for (const skill of DEFAULT_SKILLS) {
+      expect(rows.find(r => r.target === 'claude' && r.skill === skill)?.state).toBe('ok');
+      expect(rows.find(r => r.target === 'codex' && r.skill === skill)?.state).toBe('ok');
+      expect(rows.find(r => r.target === 'cursor' && r.skill === skill)?.state).toBe('absent');
+    }
+  });
+
+  it('stale: a marker whose hash matches an OLDER body reads stale and exits 1', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const oldBody = '# TestSprite Verification Loop\n\nold body from a previous CLI release\n';
+    seedFile(
+      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
+      renderOwnFileWithMarker(
+        'claude',
+        'testsprite-verify',
+        buildSkillMarker('testsprite-verify', oldBody),
+        oldBody,
+      ),
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
+      'stale',
+    );
+    expect(thrown).toBeInstanceOf(CLIError);
+    expect((thrown as CLIError).exitCode).toBe(1);
+    expect((thrown as CLIError).message).toContain('need attention');
+  });
+
+  it('modified: current hash but edited bytes reads modified and exits 1', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const canonical = renderForTarget('claude', 'testsprite-verify').content;
+    seedFile(
+      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
+      `${canonical}\n<!-- my local tweak -->\n`,
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
+      'modified',
+    );
+    expect((thrown as CLIError).exitCode).toBe(1);
+  });
+
+  it('unmarked: an artifact without a marker line reads unmarked and exits 1', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    seedFile(
+      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
+      '# hand-rolled skill file with no marker\n',
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
+      'unmarked',
+    );
+    expect((thrown as CLIError).exitCode).toBe(1);
+  });
+
+  it('rejects an explicit empty --dir (exit 5), matching the resolve-to-cwd hazard', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+    await expect(
+      runStatus({ ...statusOpts, dir: '   ' }, { cwd: CWD, fs: agentFs, ...deps }),
+    ).rejects.toMatchObject({ exitCode: 5 });
   });
 });

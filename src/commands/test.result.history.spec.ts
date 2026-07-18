@@ -169,6 +169,24 @@ describe('parseDuration', () => {
   it('case-insensitive day suffix', () => {
     expect(parseDuration('7D', NOW)).toBe('2026-05-27T12:00:00.000Z');
   });
+
+  it('overflow hours throws VALIDATION_ERROR instead of crashing', () => {
+    expect(() => parseDuration('99999999999h', NOW)).toThrow();
+    try {
+      parseDuration('99999999999h', NOW);
+    } catch (err: unknown) {
+      expect((err as { code?: string }).code).toBe('VALIDATION_ERROR');
+    }
+  });
+
+  it('overflow days throws VALIDATION_ERROR instead of crashing', () => {
+    expect(() => parseDuration('99999999999d', NOW)).toThrow();
+    try {
+      parseDuration('99999999999d', NOW);
+    } catch (err: unknown) {
+      expect((err as { code?: string }).code).toBe('VALIDATION_ERROR');
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -205,6 +223,132 @@ describe('runResultHistory — text mode', () => {
     expect(output).toMatch(/RERUN\?/);
     expect(output).toMatch(/WHEN/);
     expect(output).toMatch(/DURATION/);
+  });
+
+  it('selects/reorders columns and suppresses header/separator/detail sub-lines', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_abc/runs')) {
+        return {
+          body: makeHistoryResp([
+            makeHistoryItem({
+              runId: 'run_url_001',
+              targetUrl: 'https://staging.example.com/checkout',
+              targetUrlSource: 'run',
+            }),
+          ]),
+        };
+      }
+      return { status: 404, body: errorEnvelope('NOT_FOUND') };
+    });
+
+    await runResultHistory(
+      {
+        output: 'text',
+        testId: 'test_abc',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        columns: 'status,runid',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => lines.push(line) },
+    );
+
+    const output = lines.join('\n');
+    expect(output.split('\n')[0]).toMatch(/^passed\s+run_url_001$/);
+    expect(output).not.toMatch(/^RUN ID/m);
+    expect(output).not.toMatch(/^-+$/m);
+    expect(output).not.toContain('targetUrl:');
+  });
+
+  it('no-header suppresses only the history header and separator', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_abc/runs')) {
+        return {
+          body: makeHistoryResp([
+            makeHistoryItem({
+              runId: 'run_url_001',
+              targetUrl: 'https://staging.example.com/checkout',
+              targetUrlSource: 'run',
+            }),
+          ]),
+        };
+      }
+      return { status: 404, body: errorEnvelope('NOT_FOUND') };
+    });
+
+    await runResultHistory(
+      {
+        output: 'text',
+        testId: 'test_abc',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => lines.push(line) },
+    );
+
+    const output = lines.join('\n');
+    expect(output).not.toMatch(/^RUN ID/m);
+    expect(output).not.toMatch(/^-+$/m);
+    expect(output).toContain('run_url_001');
+    expect(output).toContain('targetUrl: https://staging.example.com/checkout');
+  });
+
+  it('rejects unknown history columns with VALIDATION_ERROR before auth/network access', async () => {
+    await expect(
+      runResultHistory(
+        {
+          output: 'text',
+          testId: 'test_abc',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+          columns: 'bogus',
+        },
+        { stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'columns' },
+    });
+  });
+
+  it('json mode ignores text-only history column flags', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_abc/runs')) {
+        return { body: makeHistoryResp() };
+      }
+      return { status: 404, body: errorEnvelope('NOT_FOUND') };
+    });
+
+    await runResultHistory(
+      {
+        output: 'json',
+        testId: 'test_abc',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        columns: 'bogus',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => lines.push(line) },
+    );
+
+    const parsed = JSON.parse(lines.join('')) as { runs: Array<{ runId: string }> };
+    expect(parsed.runs[0]?.runId).toBe('run_hist_001');
   });
 
   it('renders run_hist_001 row with status passed and source cli', async () => {
@@ -534,6 +678,32 @@ describe('runResultHistory — pagination', () => {
     );
 
     expect(capturedUrl).toContain('pageSize=5');
+  });
+
+  it('rejects fractional --page-size before making a request', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => {
+      throw new Error('should not be called');
+    });
+
+    await expect(
+      runResultHistory(
+        {
+          output: 'json',
+          testId: 'test_abc',
+          pageSize: 1.5,
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { credentialsPath, fetchImpl, stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'page-size' }),
+    });
   });
 });
 

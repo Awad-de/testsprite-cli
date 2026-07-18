@@ -110,6 +110,50 @@ describe('runConfigure', () => {
     );
   });
 
+  it('uses requestTimeoutMs for the pre-write key validation ping', async () => {
+    const { deps } = makeCapture();
+    let sawAbort = false;
+    const fetchImpl = vi.fn(
+      async (_input: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          const timeout = setTimeout(() => {
+            reject(new Error('requestTimeoutMs was not applied to the validation ping'));
+          }, 50);
+          signal?.addEventListener(
+            'abort',
+            () => {
+              sawAbort = true;
+              clearTimeout(timeout);
+              reject(new DOMException('The operation timed out.', 'TimeoutError'));
+            },
+            { once: true },
+          );
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          fromEnv: true,
+          requestTimeoutMs: 1,
+        },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          credentialsPath,
+          fetchImpl,
+        },
+      ),
+    ).rejects.toBeInstanceOf(CLIError);
+
+    expect(sawAbort).toBe(true);
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+  });
+
   it('throws VALIDATION_ERROR when --from-env is set but key is missing', async () => {
     const { deps } = makeCapture();
     await expect(
@@ -118,6 +162,100 @@ describe('runConfigure', () => {
         { ...deps, env: {}, credentialsPath },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('rejects a malformed endpoint before key validation fetch', async () => {
+    const { capture, deps } = makeCapture();
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          fromEnv: true,
+          endpointUrl: 'not-a-url',
+        },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(capture.stderr.join('\n')).not.toContain('API key rejected');
+  });
+
+  it('rejects a non-http endpoint before key validation fetch', async () => {
+    const { deps } = makeCapture();
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          fromEnv: true,
+          endpointUrl: 'ftp://example.com',
+        },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+  });
+
+  it('rejects a malformed dry-run endpoint before emitting dry-run output', async () => {
+    const { capture, deps } = makeCapture();
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          fromEnv: false,
+          dryRun: true,
+          endpointUrl: 'not-a-url',
+        },
+        {
+          ...deps,
+          env: {},
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(capture.stderr.join('\n')).not.toContain('[dry-run]');
+    expect(capture.stdout).toEqual([]);
   });
 
   it('prompts only for the API key (never the endpoint) and defaults to prod', async () => {
@@ -138,6 +276,35 @@ describe('runConfigure', () => {
       apiUrl: 'https://api.testsprite.com',
     });
     expect(capture.prelude.join('')).toContain('Configuring profile "default"');
+  });
+
+  it('routes the interactive prelude to stderr by default, keeping stdout for the result', async () => {
+    // Regression: the prelude used to default to process.stdout, polluting the
+    // result stream (and the JSON document under --output json). With no
+    // injected preludeWrite/stderr, the default must land on stderr, not stdout.
+    const stdout: string[] = [];
+    const errChunks: string[] = [];
+    const origErr = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: (c: string) => boolean }).write = c => {
+      errChunks.push(String(c));
+      return true;
+    };
+    try {
+      await runConfigure(
+        { profile: 'default', output: 'text', debug: false, fromEnv: false },
+        {
+          stdout: line => stdout.push(line),
+          prompt: { secret: vi.fn(async () => 'sk-typed') },
+          fetchImpl: meOkFetch,
+          credentialsPath,
+          env: {},
+        },
+      );
+    } finally {
+      (process.stderr as unknown as { write: typeof origErr }).write = origErr;
+    }
+    expect(errChunks.join('')).toContain('Configuring profile "default"');
+    expect(stdout.join('\n')).not.toContain('Configuring profile');
   });
 
   it('interactive path resolves the endpoint from TESTSPRITE_API_URL without prompting', async () => {
@@ -266,6 +433,46 @@ describe('runConfigure', () => {
     expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
     // Stderr must mention the rejection.
     expect(capture.stderr.join('\n')).toContain('profile NOT updated');
+  });
+
+  it('key-rejected error preserves the typed ApiError envelope (JSON contract)', async () => {
+    const { deps } = makeCapture();
+    const rejectedFetch: AuthDeps['fetchImpl'] = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 'AUTH_INVALID',
+              message: 'API key is invalid or revoked.',
+              nextAction: 'Rotate your key.',
+              requestId: 'req_reject',
+              details: { reason: 'malformed' },
+            },
+          }),
+          { status: 401, headers: { 'content-type': 'application/json' } },
+        ),
+    ) as unknown as AuthDeps['fetchImpl'];
+
+    // The thrown error must be an ApiError (with code, nextAction, requestId)
+    // — not a CLIError wrapper that drops those fields. Under --output json,
+    // index.ts renders ApiError as the full typed envelope; CLIError would
+    // render only {"error":"...string..."}, violating the JSON contract.
+    await expect(
+      runConfigure(
+        { profile: 'default', output: 'json', debug: false, fromEnv: true },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk-bad' },
+          credentialsPath,
+          fetchImpl: rejectedFetch,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'AUTH_INVALID',
+      exitCode: 3,
+      nextAction: 'Rotate your key.',
+      requestId: 'req_reject',
+    });
   });
 
   // The old "run `testsprite agent install`" self-bootstrap tip was removed with
@@ -643,6 +850,77 @@ describe('runWhoami', () => {
     expect(printed).toEqual(sampleMe);
   });
 
+  it('renders routing: v3 and the gap advisory when v3Enabled is true', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meV3 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meV3) },
+    );
+    expect(capture.stdout.join('\n')).toContain('routing: v3');
+    expect(capture.stderr.join('\n')).toContain('[advisory]');
+    expect(capture.stderr.join('\n')).toContain('test cancel');
+  });
+
+  it('renders routing: v2 and NO advisory when v3Enabled is false', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meV2 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: false }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meV2) },
+    );
+    expect(capture.stdout.join('\n')).toContain('routing: v2');
+    expect(capture.stderr.join('\n')).not.toContain('[advisory]');
+  });
+
+  it('omits the routing line when the backend does not return v3Enabled', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meResponse()) },
+    );
+    expect(capture.stdout.join('\n')).not.toContain('routing:');
+  });
+
+  it('does not emit the advisory in JSON mode even when v3Enabled is true', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meV3 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    await runWhoami(
+      { profile: 'default', output: 'json', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meV3) },
+    );
+    expect(capture.stderr.join('\n')).not.toContain('[advisory]');
+    const parsed = JSON.parse(capture.stdout.join('')) as MeResponse;
+    expect(parsed.v3Enabled).toBe(true);
+  });
+
+  it('dry-run: whitespace-only TESTSPRITE_API_URL falls through to prod default endpoint', async () => {
+    const { capture, deps } = makeCapture();
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false, dryRun: true },
+      {
+        ...deps,
+        env: { TESTSPRITE_API_URL: '   ' },
+        credentialsPath,
+      },
+    );
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('endpoint: https://api.testsprite.com');
+  });
+
   it('L1788: text output includes the resolved endpoint URL', async () => {
     writeProfile(
       'default',
@@ -1001,5 +1279,92 @@ describe('createAuthCommand surface', () => {
   it('returns an ApiError type that maps to the right exit code', () => {
     const err = ApiError.authRequired();
     expect(err.exitCode).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runConfigure -- skipIfConfigured
+// ---------------------------------------------------------------------------
+
+describe('runConfigure -- skipIfConfigured', () => {
+  it('skips the prompt and returns early when credentials already exist', async () => {
+    const { capture, deps } = makeCapture();
+    // Write a saved key first.
+    writeProfile('default', { apiKey: 'sk-existing' }, { path: credentialsPath });
+    const prompt = { secret: vi.fn(async () => 'sk-new') };
+    const fetchImpl = vi.fn();
+
+    await runConfigure(
+      { profile: 'default', output: 'text', debug: false, fromEnv: false, skipIfConfigured: true },
+      {
+        ...deps,
+        credentialsPath,
+        prompt,
+        fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+      },
+    );
+
+    // Prompt must never have fired.
+    expect(prompt.secret).not.toHaveBeenCalled();
+    // No network call -- we never validated or wrote a key.
+    expect(fetchImpl).not.toHaveBeenCalled();
+    // The saved key must be untouched.
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-existing');
+    // Output indicates already_configured.
+    expect(capture.stdout.join('\n')).toContain('already configured');
+  });
+
+  it('emits already_configured status in JSON mode', async () => {
+    const { capture, deps } = makeCapture();
+    writeProfile('default', { apiKey: 'sk-saved' }, { path: credentialsPath });
+    const fetchImpl = vi.fn();
+
+    await runConfigure(
+      { profile: 'default', output: 'json', debug: false, fromEnv: false, skipIfConfigured: true },
+      { ...deps, credentialsPath, fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'] },
+    );
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const parsed = JSON.parse(capture.stdout.join(''));
+    expect(parsed).toMatchObject({ profile: 'default', status: 'already_configured' });
+  });
+
+  it('proceeds normally when no credentials exist and skipIfConfigured is true', async () => {
+    const { deps } = makeCapture();
+    // No pre-existing profile -- skip has no effect, should fall through to prompt.
+    const prompt = { secret: vi.fn(async () => 'sk-new') };
+
+    await runConfigure(
+      { profile: 'default', output: 'text', debug: false, fromEnv: false, skipIfConfigured: true },
+      { ...deps, credentialsPath, prompt, fetchImpl: meOkFetch },
+    );
+
+    expect(prompt.secret).toHaveBeenCalledTimes(1);
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-new');
+  });
+
+  it('ignores skipIfConfigured when --from-env is set', async () => {
+    const { deps } = makeCapture();
+    // Pre-existing key -- but fromEnv should override and write a new one.
+    writeProfile('default', { apiKey: 'sk-old' }, { path: credentialsPath });
+
+    await runConfigure(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        fromEnv: true,
+        skipIfConfigured: true,
+      },
+      {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: 'sk-from-env' },
+        credentialsPath,
+        fetchImpl: meOkFetch,
+      },
+    );
+
+    // The env key must overwrite the saved key.
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-from-env');
   });
 });

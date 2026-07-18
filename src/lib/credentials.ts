@@ -7,6 +7,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { localValidationError } from './errors.js';
@@ -59,6 +60,17 @@ export type CredentialsFile = Record<string, ProfileEntry>;
 
 export interface CredentialsOptions {
   path?: string;
+}
+
+interface RestrictiveModeOptions {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  spawnSync?: (
+    command: string,
+    args: readonly string[],
+    options: { shell: false; stdio: 'ignore'; windowsHide: true },
+  ) => SpawnSyncReturns<Buffer>;
+  warn?: (line: string) => void;
 }
 
 const FILE_KEY_TO_FIELD: Record<string, keyof ProfileEntry> = {
@@ -116,7 +128,15 @@ export function serializeCredentials(file: CredentialsFile): string {
     for (const field of fields) {
       const value = entry[field];
       if (value === undefined || value === '') continue;
-      lines.push(`${FIELD_TO_FILE_KEY[field]} = ${value}`);
+      // Guard against INI injection: a value containing newline characters
+      // would be serialized across multiple lines, allowing an attacker to
+      // inject arbitrary key-value pairs (or new section headers) into the
+      // credentials file. A valid API key or URL never contains \n or \r.
+      // Strip them so a compromised env var or MITM'd backend response
+      // cannot override the stored api_key on subsequent reads.
+      const sanitized = value.replace(/[\r\n]/g, '');
+      if (sanitized === '') continue;
+      lines.push(`${FIELD_TO_FILE_KEY[field]} = ${sanitized}`);
     }
     lines.push('');
   }
@@ -164,10 +184,60 @@ export function deleteProfile(profile: string, options: CredentialsOptions = {})
   return true;
 }
 
-export function ensureRestrictiveMode(path: string): void {
+/**
+ * Enforce restrictive access on the credentials file after atomic writes.
+ * POSIX hosts use chmod(0600); Windows hosts use ACL tightening via icacls.
+ */
+export function ensureRestrictiveMode(path: string, options: RestrictiveModeOptions = {}): void {
   if (!existsSync(path)) return;
+  if ((options.platform ?? process.platform) === 'win32') {
+    ensureWindowsRestrictiveAcl(path, options);
+    return;
+  }
   const overpermissive = (statSync(path).mode & 0o077) !== 0;
   if (overpermissive) chmodSync(path, 0o600);
+}
+
+/**
+ * Restrict a Windows credentials file to the current user using icacls.
+ * The command is invoked with an args array so credential paths are never shell-interpreted.
+ */
+function ensureWindowsRestrictiveAcl(path: string, options: RestrictiveModeOptions): void {
+  const username = (options.env ?? process.env).USERNAME?.trim();
+  if (!username) {
+    warnWindowsAcl(
+      'could not determine the Windows username; credentials file permissions were not tightened',
+      options,
+    );
+    return;
+  }
+
+  const run = options.spawnSync ?? spawnSync;
+  const result = run('icacls', [path, '/inheritance:r', '/grant:r', `${username}:F`], {
+    shell: false,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+
+  if (result.error) {
+    warnWindowsAcl(
+      `icacls failed while tightening credentials file permissions: ${result.error.message}`,
+      options,
+    );
+    return;
+  }
+  if (result.status !== 0) {
+    warnWindowsAcl(
+      `icacls exited with status ${result.status ?? 'unknown'}; credentials file permissions may be too broad`,
+      options,
+    );
+  }
+}
+
+/** Emit an explicit warning when Windows ACL tightening cannot be completed. */
+function warnWindowsAcl(message: string, options: RestrictiveModeOptions): void {
+  const warn = options.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
+  warn(`[warning] ${message}`);
 }
 
 function resolvePath(options: CredentialsOptions): string {

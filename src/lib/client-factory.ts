@@ -24,8 +24,11 @@ import {
   REQUEST_TIMEOUT_MAX_MS,
   REQUEST_TIMEOUT_MIN_MS,
 } from './http.js';
+import { globalShutdown } from './interrupt.js';
 import type { OutputMode } from './output.js';
 import { createDryRunFetch } from './dry-run/fetch.js';
+import { noteServerVersion } from './version-notice.js';
+import { VERSION } from '../version.js';
 
 export interface CommonOptions {
   profile: string;
@@ -68,6 +71,12 @@ export interface ClientFactoryDeps {
   credentialsPath?: string;
   fetchImpl?: FetchImpl;
   stderr?: (line: string) => void;
+  /**
+   * Shutdown signal composed into every outgoing fetch (DEV-331 piece 1).
+   * Defaults to `globalShutdown.signal` so an armed SIGINT/SIGTERM aborts an
+   * in-flight request; tests inject their own controller's signal.
+   */
+  shutdownSignal?: AbortSignal;
 }
 
 /**
@@ -180,6 +189,59 @@ export function assertValidEndpointUrl(rawUrl: string): void {
   }
 }
 
+export function assertValidApiKeyHeaderValue(apiKey: string): void {
+  const reason =
+    'must be a non-empty HTTP header value; paste the raw key without smart punctuation, emoji, or line breaks';
+
+  if (apiKey.trim().length === 0) {
+    throw localValidationError('api-key', reason, undefined, 'field');
+  }
+
+  for (let i = 0; i < apiKey.length; i += 1) {
+    const code = apiKey.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f || code > 0xff) {
+      throw localValidationError('api-key', reason, undefined, 'field');
+    }
+  }
+}
+
+/**
+ * Parse the `--request-timeout <seconds>` flag value into milliseconds.
+ *
+ * Returns `undefined` when the flag was omitted (the factory then falls back to
+ * the `TESTSPRITE_REQUEST_TIMEOUT_MS` env var, else the 120s default).
+ *
+ * A supplied-but-invalid value (non-numeric, zero, or negative) throws a typed
+ * VALIDATION_ERROR (exit 5) rather than being silently dropped. An explicit
+ * `--request-timeout 30s` typo previously resolved to `undefined` and the
+ * command ran with the default 120s deadline — the operator believed they had
+ * set a timeout but had not, with no signal. Failing loudly here is consistent
+ * with every other validated flag (`--page-size`, `--output`, `--type`).
+ *
+ * Out-of-range but positive values are intentionally NOT rejected — they flow
+ * through to {@link resolveRequestTimeoutMs}, which clamps to
+ * `[REQUEST_TIMEOUT_MIN_MS, REQUEST_TIMEOUT_MAX_MS]`. The env-var path stays
+ * lenient by design (a stray global env var should not hard-fail every
+ * command); only the explicit per-invocation flag is strict.
+ *
+ * This single definition replaces five byte-identical copies that previously
+ * lived in `auth`, `project`, `usage`, `init`, and `test` — drift between them
+ * would have silently changed timeout behaviour depending on the command.
+ */
+export function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    // Surface the offending value in the message (same as assertValidEndpointUrl)
+    // so the operator sees exactly what they typed.
+    throw localValidationError(
+      'request-timeout',
+      `"${raw}" is not valid — must be a positive number of seconds`,
+    );
+  }
+  return Math.round(n * 1000); // seconds → milliseconds
+}
+
 export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}): HttpClient {
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const env = deps.env ?? process.env;
@@ -199,6 +261,7 @@ export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}
       onDebug: opts.debug ? (event: DebugEvent) => stderr(formatDryRunDebug(event)) : undefined,
       onTransition: opts.verbose ? (msg: string) => stderr(`[verbose] ${msg}`) : undefined,
       requestTimeoutMs,
+      shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
     });
   }
 
@@ -214,13 +277,27 @@ export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}
   // VALIDATION_ERROR rather than an opaque URL throw or a retried "fetch failed".
   assertValidEndpointUrl(config.apiUrl);
   if (!config.apiKey) throw ApiError.authRequired();
+  assertValidApiKeyHeaderValue(config.apiKey);
   return new HttpClient({
     baseUrl: facadeBaseUrl(config.apiUrl),
     apiKey: config.apiKey,
     fetchImpl: deps.fetchImpl,
     onDebug: opts.debug ? (event: DebugEvent) => stderr(formatDebug(event)) : undefined,
     onTransition: opts.verbose ? (msg: string) => stderr(`[verbose] ${msg}`) : undefined,
+    // Warn once if the backend advertises a minimum supported version above
+    // this binary's. Gating (opt-out env, TTY, output mode, dry-run) lives in
+    // noteServerVersion; the client just forwards the observed headers.
+    onServerVersion: info =>
+      noteServerVersion(info, {
+        currentVersion: VERSION,
+        env,
+        isTTY: process.stderr.isTTY === true,
+        outputMode: opts.output,
+        dryRun: opts.dryRun,
+        stderr,
+      }),
     requestTimeoutMs,
+    shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
   });
 }
 

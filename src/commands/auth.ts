@@ -1,7 +1,9 @@
 import { Command } from 'commander';
 import {
+  assertValidEndpointUrl,
   emitDryRunBanner,
   makeHttpClient,
+  parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import type { ErrorCode } from '../lib/errors.js';
@@ -15,11 +17,12 @@ import {
   readProfile,
   writeProfile,
 } from '../lib/credentials.js';
-import { loadConfig } from '../lib/config.js';
+import { loadConfig, normalizeEnvVar } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
 import type { OutputMode } from '../lib/output.js';
-import { GLOBAL_OPTS_HINT, Output } from '../lib/output.js';
+import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptSecret } from '../lib/prompt.js';
+import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 
 export interface MeResponse {
   userId: string;
@@ -35,6 +38,11 @@ export interface MeResponse {
   email?: string;
   /** Human-readable display name for the bound account. Absent-safe (dogfood L1866). */
   displayName?: string;
+  /**
+   * Authoritative per-user V3 routing bit. Absent-safe: older backends omit it,
+   * so it is only rendered when present.
+   */
+  v3Enabled?: boolean;
 }
 
 export interface AuthDeps {
@@ -63,6 +71,17 @@ type CommonOptions = FactoryCommonOptions;
 
 interface ConfigureOptions extends CommonOptions {
   fromEnv: boolean;
+  /**
+   * When true and the active profile already has a saved API key, skip the
+   * interactive key prompt and proceed directly to the skill-install step.
+   * A CI-safe flag: lets `setup` run idempotently without prompting on
+   * machines that already have credentials (e.g. re-running setup to
+   * refresh the agent skill without re-entering the key).
+   *
+   * Ignored when an explicit `--api-key` or `--from-env` key source is
+   * provided -- those paths always overwrite, regardless of existing state.
+   */
+  skipIfConfigured?: boolean;
 }
 
 const DEFAULT_API_URL = 'https://api.testsprite.com';
@@ -73,21 +92,25 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   const env = deps.env ?? process.env;
   const credentialsPath = deps.credentialsPath ?? defaultCredentialsPath();
   const out = makeOutput(opts.output, deps);
-  const prelude = deps.preludeWrite ?? ((chunk: string) => process.stdout.write(chunk));
+  // The "Configuring profile …" prelude is informational, not result data, so
+  // it defaults to stderr — stdout stays a pure result stream (the configured
+  // JSON/text), which matters under `--output json` (§8.1 stdout purity).
+  const prelude = deps.preludeWrite ?? ((chunk: string) => process.stderr.write(chunk));
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   // Normalize the env endpoint: an empty / whitespace-only TESTSPRITE_API_URL is
   // treated as unset. Without this, `''` (e.g. `export TESTSPRITE_API_URL=` in a
   // shell profile) is non-nullish and would short-circuit the `??` chains below to
   // an empty endpoint instead of falling through to the profile / prod default.
-  const envApiUrl = env.TESTSPRITE_API_URL?.trim() || undefined;
+  const envApiUrl = normalizeEnvVar(env.TESTSPRITE_API_URL);
 
   // Dry-run: do not prompt, do not read env, do not write credentials.
   // Print the canned success shape so an agent sees exactly the JSON it
   // would get on a real configure (modulo the endpoint string).
   if (opts.dryRun) {
-    emitDryRunBanner(stderr);
     const apiUrl = opts.endpointUrl ?? envApiUrl ?? DEFAULT_API_URL;
+    assertValidEndpointUrl(apiUrl);
+    emitDryRunBanner(stderr);
     stderr(`[dry-run] would write credentials for profile="${opts.profile}" to ${credentialsPath}`);
     out.print({ profile: opts.profile, apiUrl, status: 'configured' }, data => {
       const d = data as { profile: string; apiUrl: string };
@@ -113,14 +136,29 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   // api_url doesn't silently validate a new key against the default endpoint.
   const resolvedFromProfile = existingProfile?.apiUrl;
   const apiUrl = opts.endpointUrl ?? envApiUrl ?? resolvedFromProfile ?? DEFAULT_API_URL;
+  assertValidEndpointUrl(apiUrl);
 
   if (opts.fromEnv) {
     apiKey = env.TESTSPRITE_API_KEY?.trim();
     if (!apiKey) throw validationError('TESTSPRITE_API_KEY', FROM_ENV_MISSING_KEY);
   } else {
+    // --skip-if-configured: when a non-empty API key is already saved for
+    // this profile, skip the interactive prompt and return early. The
+    // key is NOT re-validated via GET /me on this path -- the caller
+    // (runInit) only reaches this when no explicit key source was given,
+    // and the subsequent whoami call in runInit will surface an expired
+    // key to the user anyway.
+    if (opts.skipIfConfigured && existingProfile?.apiKey) {
+      out.print({ profile: opts.profile, apiUrl, status: 'already_configured' }, data => {
+        const d = data as { profile: string; apiUrl: string };
+        return `Profile "${d.profile}" already configured. Endpoint: ${d.apiUrl}`;
+      });
+      return;
+    }
+
     const promptApi = deps.prompt ?? { secret: (q: string) => promptSecret(q) };
     prelude(`Configuring profile "${opts.profile}".\n`);
-    // Only the API key is prompted — the endpoint defaults to prod (see above).
+    // Only the API key is prompted -- the endpoint defaults to prod (see above).
     apiKey = (await promptApi.secret('TestSprite API key: ')).trim();
     if (!apiKey) throw new CLIError('No API key provided.', 5);
   }
@@ -145,6 +183,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
     baseUrl: facadeBaseUrl(apiUrl),
     apiKey,
     fetchImpl: deps.fetchImpl,
+    requestTimeoutMs: opts.requestTimeoutMs,
   });
   try {
     // Tag the validation call with the originating command (when provided) so
@@ -158,13 +197,22 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     stderr(`API key rejected by ${apiUrl}: ${message} — profile NOT updated`);
-    const exitCode = err instanceof ApiError ? err.exitCode : 3;
-    // Include the resolved endpoint in the thrown message so the user knows
-    // which host rejected the key. This prevents the "invalid or revoked"
-    // message from being ambiguous when the key is valid for a different env.
+    // When the verification call returned a typed API error (AUTH_INVALID,
+    // AUTH_FORBIDDEN, etc.), re-throw it directly so `index.ts` renders the
+    // full typed envelope under `--output json` (code, nextAction, requestId,
+    // details). Previously wrapping it in CLIError discarded those fields and
+    // emitted a bare `{"error":"...string..."}` — violating the JSON contract.
+    // Augment the message with the endpoint context so text-mode users still
+    // see which host rejected the key.
+    if (err instanceof ApiError) {
+      err.message = `API key rejected by ${apiUrl}: ${message} — did you mean to set TESTSPRITE_API_URL?`;
+      throw err;
+    }
+    // Non-ApiError (truly unexpected throws like a TypeError from a
+    // misconfigured fetchImpl). Exit 3 (auth family).
     throw new CLIError(
       `API key rejected by ${apiUrl}: ${message} — did you mean to set TESTSPRITE_API_URL?`,
-      exitCode,
+      3,
     );
   }
 
@@ -184,6 +232,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
 export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promise<MeResponse> {
   const out = makeOutput(opts.output, deps);
   const env = deps.env ?? process.env;
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   // Resolve the endpoint URL so it can be surfaced in text output.
   // Dry-run uses the flag/env/default chain without touching credentials.
@@ -191,7 +240,8 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
   // displayed URL always matches where requests actually go (dogfood L1788).
   let resolvedEndpoint: string;
   if (opts.dryRun) {
-    resolvedEndpoint = opts.endpointUrl ?? env.TESTSPRITE_API_URL ?? 'https://api.testsprite.com';
+    resolvedEndpoint =
+      opts.endpointUrl ?? normalizeEnvVar(env.TESTSPRITE_API_URL) ?? 'https://api.testsprite.com';
   } else {
     const credentialsPath = deps.credentialsPath ?? defaultCredentialsPath();
     const config = loadConfig({
@@ -226,6 +276,8 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
       `endpoint: ${resolvedEndpoint}`,
       `env:    ${m.env}`,
       `scopes: ${m.scopes.join(', ')}`,
+      // Authoritative routing mode, rendered only when the backend supplies it.
+      ...(m.v3Enabled !== undefined ? [`routing: ${routingLabel(m.v3Enabled)}`] : []),
     ];
     // C2: warn in text mode when key cannot write/run
     const missingScopes = (['write:tests', 'run:tests'] as const).filter(
@@ -238,6 +290,11 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
     }
     return lines.join('\n');
   });
+  // When V3 routing is on, warn (text mode only) about the still-open behavior
+  // gaps. JSON consumers read `v3Enabled` directly; stdout stays pure.
+  if (opts.output !== 'json' && me.v3Enabled === true) {
+    emitV3RoutingAdvisory(stderr);
+  }
   return me;
 }
 
@@ -318,26 +375,13 @@ function resolveCommonOptions(command: Command): CommonOptions {
   };
   return {
     profile: globals.profile ?? 'default',
-    output: globals.output ?? 'text',
+    output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,
     dryRun: globals.dryRun ?? false,
     requestTimeoutMs: parseRequestTimeoutFlag(globals.requestTimeout),
   };
-}
-
-/**
- * Parse the `--request-timeout <seconds>` flag value into milliseconds.
- * Returns `undefined` when the flag was not supplied (factory falls back to
- * the env var / default). Silently clamps out-of-range values — the
- * factory applies the same clamp so there is no double-clamp risk.
- */
-function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return undefined;
-  return Math.round(n * 1000); // seconds → milliseconds
 }
 
 function makeOutput(mode: OutputMode, deps: AuthDeps): Output {

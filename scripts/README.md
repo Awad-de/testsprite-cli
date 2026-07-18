@@ -1,0 +1,29 @@
+# `scripts/` — what runs where
+
+Every file here is classified below so nobody has to guess whether it's
+safe/expected to run on a laptop, and so a Windows contributor knows exactly
+what (if anything) they're missing. Per DEV-356 ("Windows-proof the
+toolchain"): **the release/backport shell scripts are CI-only** — nothing in
+this directory requires a human to run bash or perl locally.
+
+| File                      | Classification                                     | Runs on                                                                                                   | Notes                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `make-public-snapshot.sh` | **CI-ONLY**                                        | the release pipeline's build job (`release-build.yml`) and the nightly divergence sentinel (dry-run mode) | Builds the scrubbed public snapshot. Never ships to the public repo (it's in its own DROP list). Not meant to be run by hand — see [`docs/internal/cli-oss/release-pipeline-ops.md`](../docs/internal/cli-oss/release-pipeline-ops.md) for the operator-facing flow.                                                                                                            |
+| `backport-public-pr.sh`   | **CI-ONLY** (human-runnable for conflict recovery) | the auto-backport workflow, invoked per merged community PR                                               | Also directly runnable by an operator resolving a cherry-pick conflict (`--record-only` after a manual fix) — that's an escape hatch, not the steady-state path. Requires `bash` + `gh` + `jq`; a Windows operator resolving a conflict does it via Git Bash/WSL, or asks another maintainer — this one script is the sole remaining bash dependency in the whole release flow. |
+| `generate-version.mjs`    | **HUMAN-RUN** (Node)                               | `npm run prebuild` / `npm run generate:version`, any OS                                                   | Pure Node — no shell-out, no bash/perl/BSD-vs-GNU assumptions.                                                                                                                                                                                                                                                                                                                  |
+| `postbuild.mjs`           | **HUMAN-RUN** (Node)                               | `npm run build`, any OS                                                                                   | Pure Node `fs` calls (sets the executable bit on `dist/index.js`; a no-op on Windows, which has no POSIX exec bit).                                                                                                                                                                                                                                                             |
+| `p0-status-coverage.sql`  | **DROPPED-INTERNAL**                               | ad hoc, by an operator, against Athena                                                                    | Not part of any npm script or CI workflow. Never ships to the public repo (internal AWS resource references).                                                                                                                                                                                                                                                                   |
+
+## The upshot for a Windows contributor / operator
+
+- **Local dev loop** (`npm ci`, `npm test`, `npm run build`, `npm run lint`,
+  `npm run typecheck`) needs only **git + Node ≥ 20** — nothing in this
+  directory runs as part of that loop. See CONTRIBUTING.md's "Developing on
+  Windows" section.
+- **Releasing** does not require running `make-public-snapshot.sh` (or any
+  bash) on your own machine at all — it's a `workflow_dispatch` you trigger
+  and approve from a browser. See
+  [`docs/internal/cli-oss/release-pipeline-ops.md`](../docs/internal/cli-oss/release-pipeline-ops.md).
+- The **only** scenario that still touches bash directly is resolving a rare
+  backport cherry-pick conflict by hand — everything else in the pipeline is
+  either Node or runs unattended in Actions.

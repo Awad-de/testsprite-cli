@@ -10,7 +10,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, RequestTimeoutError } from '../lib/errors.js';
+import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import { ShutdownController } from '../lib/interrupt.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { RunResponse, TriggerRunResponse, BatchRunFreshResponse } from '../lib/runs.types.js';
@@ -1699,6 +1700,88 @@ describe('C2 — backend run renders steps: n/a (backend) in text mode', () => {
     expect(out).toContain('steps       n/a (backend)');
     expect(out).not.toContain('0/0');
   });
+
+  it('standalone BE run --wait: text probes /tests/{id} → n/a (backend); JSON never probes (DEV-282)', async () => {
+    // Standalone `test run <id>` supplies NO type hint, and the run row is
+    // terminal on the first poll (BE rows finalize server-side now), so
+    // `beFallbackUsed` stays false. In TEXT mode the card must still read
+    // `n/a (backend)`, resolved via a one-time `GET /tests/{id}` probe; in JSON
+    // mode the output is already correct and must NOT pay for that round-trip.
+    const { credentialsPath } = makeCreds();
+    const passedBeRun: RunResponse = {
+      runId: 'run_282',
+      testId: 'be_282',
+      projectId: 'p1',
+      userId: 'u1',
+      status: 'passed',
+      source: 'cli',
+      createdAt: '2026-05-15T10:00:00.000Z',
+      startedAt: '2026-05-15T10:00:01.000Z',
+      finishedAt: '2026-05-15T10:00:02.000Z',
+      codeVersion: 'v1',
+      targetUrl: 'https://example.com',
+      createdFrom: null,
+      failedStepIndex: null,
+      failureKind: null,
+      error: null,
+      videoUrl: null,
+      stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
+    };
+    const makeHandler = (urls: string[]) => (url: string) => {
+      urls.push(url);
+      if (url.includes('/tests/be_282/runs')) {
+        return {
+          body: {
+            runId: 'run_282',
+            status: 'queued',
+            enqueuedAt: '2026-05-15T10:00:00.000Z',
+            codeVersion: 'v1',
+            targetUrl: 'https://example.com',
+          },
+        };
+      }
+      if (url.includes('/runs/run_282')) return { body: passedBeRun };
+      // Bare type probe: GET /tests/be_282 (no /runs, no /result suffix).
+      if (/\/tests\/be_282$/.test(url)) return { body: { id: 'be_282', type: 'backend' } };
+      return { status: 404, body: {} };
+    };
+    const runOnce = async (output: 'text' | 'json') => {
+      const urls: string[] = [];
+      const stdoutLines: string[] = [];
+      await runTestRun(
+        {
+          profile: 'default',
+          output,
+          debug: false,
+          dryRun: false,
+          testId: 'be_282',
+          wait: true,
+          timeoutSeconds: 60,
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(makeHandler(urls)),
+          stdout: line => stdoutLines.push(line),
+          stderr: () => {},
+          sleep: instantSleep,
+        },
+      );
+      return { urls, out: stdoutLines.join('\n') };
+    };
+
+    // Text mode: probes the type and renders the honest backend placeholder.
+    const text = await runOnce('text');
+    expect(text.out).toContain('steps       n/a (backend)');
+    expect(text.out).not.toContain('0/0');
+    expect(text.urls.some(u => /\/tests\/be_282$/.test(u))).toBe(true);
+
+    // JSON mode: no extra probe; the wire envelope ships stepSummary verbatim.
+    const json = await runOnce('json');
+    expect(json.urls.some(u => /\/tests\/be_282$/.test(u))).toBe(false);
+    const parsed = JSON.parse(json.out);
+    expect(parsed.status).toBe('passed');
+    expect(parsed.stepSummary).toEqual({ total: 0, completed: 0, passedCount: 0, failedCount: 0 });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1932,6 +2015,74 @@ describe('runTestRun --wait: Fix 3 — RequestTimeoutError writes partial JSON t
     const stderrBlock = stderrLines.join('\n');
     expect(stderrBlock).toContain(TRIGGER_RESP.runId);
     expect(stderrBlock).toContain('test wait');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TimeoutError on --wait: partial stdout + exit 7
+// ---------------------------------------------------------------------------
+
+describe('runTestRun --wait: TimeoutError writes partial JSON to stdout', () => {
+  it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
+    const { credentialsPath } = makeCreds();
+    let dateCallCount = 0;
+    let fetchCallCount = 0;
+    const base = Date.now();
+    const realDateNow = Date.now;
+    Date.now = () => (++dateCallCount > 6 ? base + 2000 : base);
+
+    try {
+      const fetchImpl: typeof globalThis.fetch = async () => {
+        ++fetchCallCount;
+        if (fetchCallCount === 1) {
+          return new Response(JSON.stringify(TRIGGER_RESP), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        const runningRun: RunResponse = { ...makePassedRun(), status: 'running' };
+        return new Response(JSON.stringify(runningRun), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+
+      const stdoutLines: string[] = [];
+      const stderrLines: string[] = [];
+
+      await expect(
+        runTestRun(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            verbose: false,
+            dryRun: false,
+            testId: 'test_xyz',
+            wait: true,
+            timeoutSeconds: 1,
+          },
+          {
+            credentialsPath,
+            fetchImpl: fetchImpl as unknown as FetchImpl,
+            stdout: line => stdoutLines.push(line),
+            stderr: line => stderrLines.push(line),
+            sleep: instantSleep,
+          },
+        ),
+      ).rejects.toMatchObject({ exitCode: 7 });
+
+      const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
+        runId: string;
+        status: string;
+        targetUrl: string;
+      };
+      expect(stdoutJson.runId).toBe(TRIGGER_RESP.runId);
+      expect(stdoutJson.status).toBe('running');
+      expect(stdoutJson.targetUrl).toBe(TRIGGER_RESP.targetUrl);
+    } finally {
+      Date.now = realDateNow;
+    }
   });
 });
 
@@ -2485,6 +2636,61 @@ describe('runTestRunAll — batch fresh run', () => {
     );
     const payload = JSON.parse(out.join('\n')) as { accepted: Array<{ status: string }> };
     expect(payload.accepted.every(r => r.status === 'passed')).toBe(true);
+  });
+
+  it('run --all --wait: does not start a fresh poll for a queued run after the shared deadline expired', async () => {
+    const { credentialsPath } = makeCreds();
+    const baseNow = new Date('2026-06-09T10:00:00.000Z').getTime();
+    let nowMs = baseNow;
+    const runFetches: string[] = [];
+    const stdoutLines: string[] = [];
+    let caughtError: unknown;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
+
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'POST') return { body: BATCH_FRESH_RESP };
+
+      const runId = url.split('/runs/')[1]?.split('?')[0] ?? 'run_unknown';
+      runFetches.push(runId);
+      if (runId === 'run_fresh_01') {
+        nowMs = baseNow + 2000;
+        return { body: makePassedRun(runId, 'test_be_01') };
+      }
+      return { body: makePassedRun(runId, 'test_be_02') };
+    });
+
+    try {
+      await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 1,
+          maxConcurrency: 1,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: line => stdoutLines.push(line),
+          stderr: () => undefined,
+          sleep: instantSleep,
+        },
+      );
+    } catch (err) {
+      caughtError = err;
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    const payload = JSON.parse(stdoutLines.join('\n')) as {
+      accepted: Array<{ runId: string; status: string }>;
+    };
+    expect(runFetches).toEqual(['run_fresh_01']);
+    expect(payload.accepted.find(r => r.runId === 'run_fresh_02')?.status).toBe('timeout');
+    expect((caughtError as { exitCode?: number } | undefined)?.exitCode).toBe(7);
   });
 
   it('--wait with a failed run → exit 1', async () => {
@@ -3470,6 +3676,39 @@ describe('dashboardUrl on run completion', () => {
     );
   });
 
+  it('run --all: emits the auto-minted idempotency-key on stderr in JSON output mode (parity with test run)', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', PROD_API);
+    const batchResp: BatchRunFreshResponse = {
+      accepted: [
+        { testId: 'test_be_01', runId: 'run_f_01', enqueuedAt: '2026-06-10T10:00:00.000Z' },
+      ],
+      conflicts: [],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const stderrLines: string[] = [];
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: false,
+        timeoutSeconds: 600,
+        maxConcurrency: 10,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: batchResp })),
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+    expect(stderrLines.some(l => l.startsWith('idempotency-key:'))).toBe(true);
+  });
+
   it('run --all --wait (prod endpoint): summary items carry dashboardUrl + stderr Dashboard line', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', PROD_API);
     const batchResp: BatchRunFreshResponse = {
@@ -3534,5 +3773,138 @@ describe('dashboardUrl on run completion', () => {
         l.includes('Dashboard: https://www.testsprite.com/dashboard/tests/project_be'),
       ),
     ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Batch --all --wait fan-out: RequestTimeoutError must not leave stdout empty
+// ---------------------------------------------------------------------------
+
+describe('[finding-5] runTestRunAll --wait: RequestTimeoutError during fan-out poll writes JSON stdout + exit 7', () => {
+  it('stdout contains accepted[] with runIds when member polls throw RequestTimeoutError', async () => {
+    const { credentialsPath } = makeCreds();
+    const batchResp: BatchRunFreshResponse = {
+      accepted: [
+        { testId: 'test_be_01', runId: 'run_fresh_01', enqueuedAt: '2026-06-09T10:00:00.000Z' },
+        { testId: 'test_be_02', runId: 'run_fresh_02', enqueuedAt: '2026-06-09T10:00:01.000Z' },
+      ],
+      conflicts: [],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: batchResp };
+      if (url.includes('/runs/')) {
+        throw new RequestTimeoutError(120000, 'req_timeout_batch_all');
+      }
+      return errorBody('NOT_FOUND');
+    });
+    const stdoutLines: string[] = [];
+
+    const err = await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+
+    expect(err).toMatchObject({ exitCode: 7 });
+    expect(stdoutLines.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(stdoutLines.join('\n')) as {
+      accepted: Array<{ testId: string; runId: string; status: string }>;
+    };
+    expect(parsed.accepted).toHaveLength(2);
+    expect(parsed.accepted.map(r => r.runId).sort()).toEqual(['run_fresh_01', 'run_fresh_02']);
+    expect(parsed.accepted.every(r => r.status === 'timeout')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEV-331 piece 1 — graceful detach on SIGINT during test run --wait
+// ---------------------------------------------------------------------------
+
+describe('runTestRun --wait — InterruptError graceful detach (DEV-331)', () => {
+  it('SIG-1: trigger succeeds, poll interrupted → partial to stdout + honest stderr + exit 130', async () => {
+    const { credentialsPath } = makeCreds();
+    const shutdown = new ShutdownController();
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+
+    // Trigger POST resolves; the subsequent GET /runs/{id} long-poll hangs
+    // until the composed signal aborts (real-fetch contract).
+    const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      if (init.method === 'POST') {
+        return new Response(JSON.stringify(TRIGGER_RESP), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      void url;
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init.signal;
+        const rejectWithReason = (): void => {
+          const reason: unknown = signal?.reason;
+          reject(reason instanceof Error ? reason : new Error('aborted'));
+        };
+        if (signal?.aborted) {
+          rejectWithReason();
+          return;
+        }
+        signal?.addEventListener('abort', rejectWithReason, { once: true });
+      });
+    }) as typeof globalThis.fetch;
+
+    const pending = runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 600,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+        shutdown,
+      },
+    );
+    setTimeout(() => shutdown.interrupt('SIGINT'), 5);
+
+    const err = await pending.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect((err as InterruptError).exitCode).toBe(130);
+
+    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as { runId: string; status: string };
+    expect(stdoutJson.runId).toBe('run_abc');
+    expect(stdoutJson.status).toBe('running');
+
+    const stderrBlock = stderrLines.join('\n');
+    expect(stderrBlock).toContain('Interrupted (SIGINT)');
+    expect(stderrBlock).toContain('billing');
+    expect(stderrBlock).toContain('testsprite test wait run_abc');
   });
 });
