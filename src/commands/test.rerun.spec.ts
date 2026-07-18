@@ -4819,6 +4819,7 @@ describe('rerun --wait — dashboardUrl on terminal output', () => {
     );
   });
 });
+
 // ---------------------------------------------------------------------------
 // Batch --all --wait fan-out: RequestTimeoutError must not leave stdout empty
 // ---------------------------------------------------------------------------
@@ -4854,7 +4855,7 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
         output: 'json',
         debug: false
       },
-      { ...creds, sleep: instantSleep, fetchImpl: fetchImpl as any, stdout: (l) => stdoutLines.push(l), stderr: () => undefined }
+      { ...creds, sleep: instantSleep, fetchImpl: fetchImpl as unknown as FetchImpl, stdout: (l) => stdoutLines.push(l), stderr: () => undefined }
     ).catch((e) => e);
     expect(err).toMatchObject({ exitCode: 7 });
   });
@@ -4867,8 +4868,8 @@ describe('[finding-4] single FE rerun --wait: TimeoutError writes partial JSON t
   it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
     const creds = makeCreds();
     const rerunResp = { runId: 'run_fe_01', status: 'accepted' };
-    const fetchImpl: any = async (input: any) => {
-      const url = typeof input === 'string' ? input : input.url;
+    const fetchImpl: FetchImpl = async (input) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
       if (url.includes('/runs/rerun')) return new Response(JSON.stringify(rerunResp), { status: 202 });
       if (url.includes('/runs/')) return new Response(JSON.stringify({ runId: rerunResp.runId, status: 'running', finishedAt: null }), { status: 200 });
       return new Response(JSON.stringify({ error: { code: 'NOT_FOUND' } }), { status: 404 });
@@ -4888,10 +4889,10 @@ describe('[finding-4] single FE rerun --wait: TimeoutError writes partial JSON t
         profile: 'default',
         debug: false
       },
-      { ...creds, sleep: instantSleep, fetchImpl: fetchImpl as any, stdout: (l) => stdoutLines.push(l), stderr: () => undefined }
+      { ...creds, sleep: instantSleep, fetchImpl: fetchImpl as unknown as FetchImpl, stdout: (l) => stdoutLines.push(l), stderr: () => undefined }
     ).catch((e) => e);
     expect(err).toMatchObject({ exitCode: 7 });
-    const parsed = JSON.parse(stdoutLines.join('\n'));
+    const parsed = JSON.parse(stdoutLines.join('\n')) as { runId: string; status: string };
     expect(parsed.runId).toBe(rerunResp.runId);
     expect(parsed.status).toBe('running');
   });
