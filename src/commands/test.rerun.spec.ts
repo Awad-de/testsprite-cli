@@ -4855,7 +4855,7 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
         autoHeal: false,
         autoHealExplicit: false,
         skipDependencies: false,
-        maxConcurrency: 1, // تأكدت من وجود الفواصل هنا
+        maxConcurrency: 1, 
         profile: 'default',
         output: 'json',
         debug: false
