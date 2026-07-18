@@ -9,8 +9,8 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
-import { ShutdownController } from '../lib/interrupt.js';
+import { ApiError, RequestTimeoutError } from '../lib/errors.js';
+
 import type { RunResponse, RerunResponse, BatchRerunResponse } from '../lib/runs.types.js';
 import type { FetchImpl } from '../lib/http.js';
 import { runTestRerun, resolveWaitRequestTimeoutMs } from './test.js';
