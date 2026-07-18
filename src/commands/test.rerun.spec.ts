@@ -2889,7 +2889,7 @@ describe('[fix-1] batch rerun: notFound[] ids aggregated and warned on stderr', 
         ...creds,
         sleep: instantSleep,
         fetchImpl,
-        stdout: () => { },
+        stdout: () => {},
         stderr: line => stderrLines.push(line),
       },
     );
@@ -2945,7 +2945,7 @@ describe('[fix-1] batch rerun: notFound[] ids aggregated and warned on stderr', 
         ...creds,
         sleep: instantSleep,
         fetchImpl,
-        stdout: () => { },
+        stdout: () => {},
         stderr: line => stderrLines.push(line),
       },
     );
@@ -3177,7 +3177,7 @@ describe('runTestRerun --all --skip-terminal (dogfood L1796)', () => {
         ...creds,
         sleep: instantSleep,
         fetchImpl: makeFilterFetch(dispatched),
-        stderr: () => { },
+        stderr: () => {},
       },
     );
 
@@ -4835,7 +4835,7 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
       closure: { byProject: [] },
     };
 
-    const fetchImpl = makeFetch((url) => {
+    const fetchImpl = makeFetch(url => {
       if (url.includes('/tests/batch/rerun')) {
         return { status: 202, body: batchResp };
       }
@@ -4864,18 +4864,18 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
         ...creds,
         sleep: instantSleep,
         fetchImpl: fetchImpl as unknown as FetchImpl,
-        stdout: (line) => stdoutLines.push(line),
+        stdout: line => stdoutLines.push(line),
         stderr: () => undefined,
       },
-    ).catch((e) => e);
+    ).catch(e => e);
 
     expect(err).toMatchObject({ exitCode: 7 });
     const parsed = JSON.parse(stdoutLines.join('\n')) as {
       accepted: Array<{ testId: string; runId: string; status: string }>;
     };
     expect(parsed.accepted).toHaveLength(2);
-    expect(parsed.accepted.map((r) => r.runId).sort()).toEqual(['run_b1', 'run_b2']);
-    expect(parsed.accepted.every((r) => r.status === 'timeout')).toBe(true);
+    expect(parsed.accepted.map(r => r.runId).sort()).toEqual(['run_b1', 'run_b2']);
+    expect(parsed.accepted.every(r => r.status === 'timeout')).toBe(true);
   });
 });
 
@@ -4938,10 +4938,10 @@ describe('[finding-4] single FE rerun --wait: TimeoutError writes partial JSON t
         ...creds,
         sleep: instantSleep,
         fetchImpl: fetchImpl as unknown as FetchImpl,
-        stdout: (line) => stdoutLines.push(line),
+        stdout: line => stdoutLines.push(line),
         stderr: () => undefined,
       },
-    ).catch((e) => e);
+    ).catch(e => e);
 
     expect(err).toMatchObject({ exitCode: 7 });
     expect(stdoutLines.length).toBeGreaterThan(0);
