@@ -4824,6 +4824,7 @@ describe('rerun --wait — dashboardUrl on terminal output', () => {
 // ---------------------------------------------------------------------------
 describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out poll writes JSON stdout + exit 7', () => {
   it('stdout contains accepted[] with runIds when member polls throw RequestTimeoutError', async () => {
+    const creds = makeCreds();
     const batchResp: BatchRerunResponse = {
       accepted: [
         { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
@@ -4864,7 +4865,6 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
 // ---------------------------------------------------------------------------
 // TimeoutError on single FE rerun --wait: partial stdout + exit 7
 // ---------------------------------------------------------------------------
-
 describe('[finding-4] single FE rerun --wait: TimeoutError writes partial JSON to stdout', () => {
   it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
     const creds = makeCreds();
