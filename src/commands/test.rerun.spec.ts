@@ -4847,7 +4847,7 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
 
     const stdoutLines: string[] = [];
     const err = await runTestRerun(
-      { testIds: ['test_1', 'test_2'], all: false, wait: true, timeoutSeconds: 60, autoHeal: false, autoHealExplicit: false, skipDependencies: false },
+      { testIds: ['test_1', 'test_2'], all: false, wait: true, timeoutSeconds: 60, autoHeal: false, autoHealExplicit: false, skipDependencies: false maxConcurrency: 1, profile: 'default', output: 'json'},
       { ...creds, sleep: instantSleep, fetchImpl: fetchImpl as unknown as FetchImpl, stdout: (line) => stdoutLines.push(line), stderr: () => undefined }
     ).catch(e => e);
 
