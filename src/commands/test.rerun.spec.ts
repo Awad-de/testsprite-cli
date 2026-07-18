@@ -2889,7 +2889,7 @@ describe('[fix-1] batch rerun: notFound[] ids aggregated and warned on stderr', 
         ...creds,
         sleep: instantSleep,
         fetchImpl,
-        stdout: () => {},
+        stdout: () => { },
         stderr: line => stderrLines.push(line),
       },
     );
@@ -2945,7 +2945,7 @@ describe('[fix-1] batch rerun: notFound[] ids aggregated and warned on stderr', 
         ...creds,
         sleep: instantSleep,
         fetchImpl,
-        stdout: () => {},
+        stdout: () => { },
         stderr: line => stderrLines.push(line),
       },
     );
@@ -3177,7 +3177,7 @@ describe('runTestRerun --all --skip-terminal (dogfood L1796)', () => {
         ...creds,
         sleep: instantSleep,
         fetchImpl: makeFilterFetch(dispatched),
-        stderr: () => {},
+        stderr: () => { },
       },
     );
 
