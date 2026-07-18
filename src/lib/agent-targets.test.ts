@@ -34,7 +34,9 @@ import {
  * The description value is a single line (no folded/literal block scalars).
  */
 function parseFrontmatterDescription(content: string): string | undefined {
-  const lines = content.split('\n');
+  // Tolerate CRLF so a Windows checkout (autocrlf) doesn't leave a trailing
+  // \r on the description and break the byte-identical comparisons.
+  const lines = content.split(/\r?\n/);
   let inFrontmatter = false;
   for (const line of lines) {
     if (line.trim() === '---') {
@@ -444,6 +446,27 @@ describe('loadCodexSkillBody', () => {
   it('testsprite-verify.codex.md is ≤ 6144 bytes (6 KiB trim budget)', () => {
     const body = loadCodexSkillBody();
     expect(Buffer.byteLength(body, 'utf8')).toBeLessThanOrEqual(6144);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// content integrity — current auth command names
+// ---------------------------------------------------------------------------
+
+describe('content integrity — testsprite-verify auth commands', () => {
+  it('uses current auth/setup commands in every canonical verify skill asset', () => {
+    const assets = [
+      ['docs template', templateRaw],
+      ['own-file skill body', loadSkillBodyFor('testsprite-verify')],
+      ['codex skill body', codexContentFor('testsprite-verify')],
+    ] as const;
+
+    for (const [name, content] of assets) {
+      expect(content, name).toContain('testsprite auth status');
+      expect(content, name).toContain('testsprite setup');
+      expect(content, name).not.toContain('auth whoami');
+      expect(content, name).not.toContain('auth configure');
+    }
   });
 });
 

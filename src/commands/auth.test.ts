@@ -850,6 +850,63 @@ describe('runWhoami', () => {
     expect(printed).toEqual(sampleMe);
   });
 
+  it('renders routing: v3 and the gap advisory when v3Enabled is true', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meV3 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meV3) },
+    );
+    expect(capture.stdout.join('\n')).toContain('routing: v3');
+    expect(capture.stderr.join('\n')).toContain('[advisory]');
+    expect(capture.stderr.join('\n')).toContain('test cancel');
+  });
+
+  it('renders routing: v2 and NO advisory when v3Enabled is false', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meV2 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: false }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meV2) },
+    );
+    expect(capture.stdout.join('\n')).toContain('routing: v2');
+    expect(capture.stderr.join('\n')).not.toContain('[advisory]');
+  });
+
+  it('omits the routing line when the backend does not return v3Enabled', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meResponse()) },
+    );
+    expect(capture.stdout.join('\n')).not.toContain('routing:');
+  });
+
+  it('does not emit the advisory in JSON mode even when v3Enabled is true', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meV3 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    await runWhoami(
+      { profile: 'default', output: 'json', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meV3) },
+    );
+    expect(capture.stderr.join('\n')).not.toContain('[advisory]');
+    const parsed = JSON.parse(capture.stdout.join('')) as MeResponse;
+    expect(parsed.v3Enabled).toBe(true);
+  });
+
   it('dry-run: whitespace-only TESTSPRITE_API_URL falls through to prod default endpoint', async () => {
     const { capture, deps } = makeCapture();
     await runWhoami(
@@ -1222,5 +1279,92 @@ describe('createAuthCommand surface', () => {
   it('returns an ApiError type that maps to the right exit code', () => {
     const err = ApiError.authRequired();
     expect(err.exitCode).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runConfigure -- skipIfConfigured
+// ---------------------------------------------------------------------------
+
+describe('runConfigure -- skipIfConfigured', () => {
+  it('skips the prompt and returns early when credentials already exist', async () => {
+    const { capture, deps } = makeCapture();
+    // Write a saved key first.
+    writeProfile('default', { apiKey: 'sk-existing' }, { path: credentialsPath });
+    const prompt = { secret: vi.fn(async () => 'sk-new') };
+    const fetchImpl = vi.fn();
+
+    await runConfigure(
+      { profile: 'default', output: 'text', debug: false, fromEnv: false, skipIfConfigured: true },
+      {
+        ...deps,
+        credentialsPath,
+        prompt,
+        fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+      },
+    );
+
+    // Prompt must never have fired.
+    expect(prompt.secret).not.toHaveBeenCalled();
+    // No network call -- we never validated or wrote a key.
+    expect(fetchImpl).not.toHaveBeenCalled();
+    // The saved key must be untouched.
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-existing');
+    // Output indicates already_configured.
+    expect(capture.stdout.join('\n')).toContain('already configured');
+  });
+
+  it('emits already_configured status in JSON mode', async () => {
+    const { capture, deps } = makeCapture();
+    writeProfile('default', { apiKey: 'sk-saved' }, { path: credentialsPath });
+    const fetchImpl = vi.fn();
+
+    await runConfigure(
+      { profile: 'default', output: 'json', debug: false, fromEnv: false, skipIfConfigured: true },
+      { ...deps, credentialsPath, fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'] },
+    );
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const parsed = JSON.parse(capture.stdout.join(''));
+    expect(parsed).toMatchObject({ profile: 'default', status: 'already_configured' });
+  });
+
+  it('proceeds normally when no credentials exist and skipIfConfigured is true', async () => {
+    const { deps } = makeCapture();
+    // No pre-existing profile -- skip has no effect, should fall through to prompt.
+    const prompt = { secret: vi.fn(async () => 'sk-new') };
+
+    await runConfigure(
+      { profile: 'default', output: 'text', debug: false, fromEnv: false, skipIfConfigured: true },
+      { ...deps, credentialsPath, prompt, fetchImpl: meOkFetch },
+    );
+
+    expect(prompt.secret).toHaveBeenCalledTimes(1);
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-new');
+  });
+
+  it('ignores skipIfConfigured when --from-env is set', async () => {
+    const { deps } = makeCapture();
+    // Pre-existing key -- but fromEnv should override and write a new one.
+    writeProfile('default', { apiKey: 'sk-old' }, { path: credentialsPath });
+
+    await runConfigure(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        fromEnv: true,
+        skipIfConfigured: true,
+      },
+      {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: 'sk-from-env' },
+        credentialsPath,
+        fetchImpl: meOkFetch,
+      },
+    );
+
+    // The env key must overwrite the saved key.
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-from-env');
   });
 });

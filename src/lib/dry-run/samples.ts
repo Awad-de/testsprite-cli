@@ -16,7 +16,11 @@
  * If the CLI OpenAPI spec changes, both this file AND
  * `test/mock-backend/fixtures.ts` must be updated in the same PR.
  */
-import type { CliProject, CliUpdateProjectResponse } from '../../commands/project.js';
+import type {
+  CliProject,
+  CliUpdateProjectResponse,
+  CliDeleteProjectResponse,
+} from '../../commands/project.js';
 import type {
   CliBulkDeleteSummary,
   CliFailureContext,
@@ -36,6 +40,7 @@ import type {
   BatchRerunResponse,
   BatchRunFreshResponse,
   ListRunsResponse,
+  CancelRunResponse,
 } from '../runs.types.js';
 
 const SAMPLE_USER_ID = '11111111-1111-4111-8111-111111111111';
@@ -104,6 +109,7 @@ const me: MeResponse = {
   keyId: SAMPLE_KEY_ID,
   scopes: ['read:projects', 'read:tests', 'write:tests', 'run:tests'],
   env: 'development',
+  v3Enabled: true,
 };
 
 const projects: CliProject[] = [
@@ -397,6 +403,11 @@ const ENTRIES: DryRunSampleEntry[] = [
     updatedFields: ['name'],
     updatedAt: '2026-05-16T00:00:00.000Z',
   } satisfies CliUpdateProjectResponse),
+  // DELETE /projects/{id} (cascade delete project + tests + fixtures).
+  entry('deleteProject', 'DELETE', '/projects/{projectId}', {
+    projectId: SAMPLE_PROJECT_ID,
+    deletedAt: '2026-05-16T00:00:00.000Z',
+  } satisfies CliDeleteProjectResponse),
   entry('listTests', 'GET', '/tests', pageOf(tests)),
   entry('getTestCode', 'GET', '/tests/{testId}/code', testCode),
   entry('listTestSteps', 'GET', '/tests/{testId}/steps', pageOf(testSteps)),
@@ -747,6 +758,36 @@ const ENTRIES: DryRunSampleEntry[] = [
       },
     ],
   } satisfies RunResponse),
+  // DEV-331 piece 3 — POST /runs/{runId}/cancel. Method-guarded in
+  // `findSample` (POST vs `getRun`'s GET), so this can't be shadowed by the
+  // broader `/runs/{runId}` pattern above despite sharing its path prefix.
+  // `alreadyCancelled: false` — a fresh cancel is the more instructive shape
+  // for a dry-run learner than the idempotent no-op.
+  entry('cancelRun', 'POST', '/runs/{runId}/cancel', {
+    runId: SAMPLE_RUN_ID,
+    testId: SAMPLE_TEST_ID_PASSED,
+    projectId: SAMPLE_PROJECT_ID,
+    userId: SAMPLE_USER_ID,
+    status: 'cancelled',
+    source: 'cli',
+    createdAt: '2026-05-15T19:32:00.000Z',
+    startedAt: '2026-05-15T19:32:05.000Z',
+    finishedAt: '2026-05-15T19:33:12.000Z',
+    codeVersion: 'v1',
+    targetUrl: SAMPLE_TARGET_URL,
+    createdFrom: null,
+    failedStepIndex: null,
+    failureKind: null,
+    error: null,
+    videoUrl: null,
+    stepSummary: {
+      total: 8,
+      completed: 3,
+      passedCount: 3,
+      failedCount: 0,
+    },
+    alreadyCancelled: false,
+  } satisfies CancelRunResponse),
 ];
 
 function entry(

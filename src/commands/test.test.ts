@@ -33,6 +33,7 @@ import {
   runGet,
   runLint,
   runList,
+  runOpen,
   runPlanPut,
   runResult,
   runScaffold,
@@ -120,6 +121,7 @@ describe('createTestCommand — surface', () => {
     const names = test.commands.map(c => c.name()).sort();
     expect(names).toEqual([
       'artifact',
+      'cancel',
       'code',
       'create',
       'create-batch',
@@ -131,6 +133,7 @@ describe('createTestCommand — surface', () => {
       'get',
       'lint',
       'list',
+      'open',
       'plan',
       'rerun',
       'result',
@@ -199,6 +202,7 @@ describe('createTestCommand — surface', () => {
   it('result exposes --include-analysis (M2.1) + M3.4 piece-5 --history flags', () => {
     // M2.1 piece 3 adds `--include-analysis` to `test result`.
     // M3.4 piece 5 adds `--history`, `--source`, `--since`, `--page-size`, `--cursor`.
+    // Issue #165 adds text-table shaping via `--columns` and `--no-header`.
     // Pinning the surface so a future flag-consolidation sweep keeps every
     // option intentional. Back-compat: bare `test result <id>` (no --history)
     // still calls runResult and returns the M2 CliLatestResult shape.
@@ -212,6 +216,8 @@ describe('createTestCommand — surface', () => {
       '--since',
       '--page-size',
       '--cursor',
+      '--columns',
+      '--no-header',
     ]);
   });
 
@@ -464,6 +470,14 @@ describe('runList', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   });
 
+  it('rejects --status=junk before reading credentials', async () => {
+    const test = createTestCommand();
+    disableExits(test);
+    await expect(
+      test.parseAsync(['list', '--project', 'project_alice', '--status', 'junk'], { from: 'user' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
   it('rejects --page-size=0 locally with VALIDATION_ERROR (no network call)', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => {
@@ -572,6 +586,74 @@ describe('runList', () => {
     // accidentally hardcode a value.
     expect(block).toContain('portal');
     expect(block).toContain('mcp');
+  });
+
+  it('text mode selects/reorders columns and suppresses the header', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [FE_TEST, BE_TEST], nextToken: null },
+    }));
+    const out: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_alice',
+        pageSize: 25,
+        columns: 'status,id',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    const lines = out.join('\n').split('\n');
+    expect(lines[0]).toMatch(/^failed\s+test_fe$/);
+    expect(lines[1]).toMatch(/^passed\s+test_be$/);
+    expect(out.join('\n')).not.toContain('STATUS');
+    expect(out.join('\n')).not.toContain('UPDATED');
+  });
+
+  it('text mode rejects unknown columns with VALIDATION_ERROR before auth/network access', async () => {
+    await expect(
+      runList(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          projectId: 'project_alice',
+          pageSize: 25,
+          columns: 'bogus',
+        },
+        { stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'columns' },
+    });
+  });
+
+  it('json mode ignores text-only column flags', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [FE_TEST], nextToken: null },
+    }));
+    const out: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        pageSize: 25,
+        columns: 'bogus',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    expect(JSON.parse(out.join('\n')).items[0].id).toBe('test_fe');
   });
 
   it('text mode reads "No tests." when items is empty and nextToken is null', async () => {
@@ -832,6 +914,40 @@ describe('runGet', () => {
       { credentialsPath, fetchImpl, stdout: line => out.push(line) },
     );
     expect(out.join('\n')).not.toContain('planSteps:');
+  });
+
+  it('renders produces/consumes/category when the facade ships them', async () => {
+    const withDeps: CliTest = {
+      ...FE_TEST,
+      produces: ['user_id', 'order_id'],
+      consumes: ['session_token'],
+      category: 'teardown',
+    };
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: withDeps }));
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    const block = out.join('\n');
+    expect(block).toContain('produces:    user_id, order_id');
+    expect(block).toContain('consumes:    session_token');
+    expect(block).toContain('category:    teardown');
+  });
+
+  it('omits produces/consumes/category lines when absent', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: FE_TEST }));
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    const block = out.join('\n');
+    expect(block).not.toContain('produces:');
+    expect(block).not.toContain('consumes:');
+    expect(block).not.toContain('category:');
   });
 
   it('NOT_FOUND envelope from server propagates as ApiError exit 4', async () => {
@@ -2412,6 +2528,94 @@ describe('runScaffold', () => {
         { stdout: () => undefined, stderr: () => undefined, env: {} },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+});
+
+describe('runOpen', () => {
+  // The mock endpoint host has no portal mapping; the operator override is the
+  // supported escape hatch and gives the tests a deterministic base.
+  beforeEach(() => {
+    process.env.TESTSPRITE_PORTAL_URL = 'https://portal.example.com';
+  });
+  afterEach(() => {
+    delete process.env.TESTSPRITE_PORTAL_URL;
+  });
+
+  const TEST_ROW = {
+    id: 'test_open_me',
+    projectId: 'project_alice',
+    projectName: 'Alice',
+    name: 'Checkout',
+    type: 'frontend',
+    createdFrom: 'cli',
+    status: 'ready',
+    createdAt: '2026-06-01T10:00:00.000Z',
+    updatedAt: '2026-06-01T10:00:00.000Z',
+  };
+
+  it('prints the dashboard URL and spawns the opener with it', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: TEST_ROW }));
+    const out: string[] = [];
+    const opened: string[] = [];
+    const result = await runOpen(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        testId: 'test_open_me',
+        noBrowser: false,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+      url => opened.push(url),
+    );
+    expect(result.dashboardUrl).toContain('/dashboard/tests/project_alice/test/test_open_me');
+    expect(out.join('\n')).toContain(result.dashboardUrl);
+    expect(opened).toEqual([result.dashboardUrl]);
+  });
+
+  it('--no-browser prints the URL but never spawns', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: TEST_ROW }));
+    const out: string[] = [];
+    const opened: string[] = [];
+    await runOpen(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_open_me',
+        noBrowser: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+      url => opened.push(url),
+    );
+    expect(opened).toEqual([]);
+    expect((JSON.parse(out.join('')) as { dashboardUrl: string }).dashboardUrl).toContain(
+      'test_open_me',
+    );
+  });
+
+  it('a broken opener downgrades to a stderr hint, never a failure', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: TEST_ROW }));
+    const errs: string[] = [];
+    await expect(
+      runOpen(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          testId: 'test_open_me',
+          noBrowser: false,
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: line => errs.push(line) },
+        () => {
+          throw new Error('no display');
+        },
+      ),
+    ).resolves.toBeDefined();
+    expect(errs.join('\n')).toContain('could not launch a browser');
   });
 });
 
@@ -4631,6 +4835,48 @@ describe('runCreate', () => {
     expect(sent.headers.get('x-api-key')).toBe('sk-user-test');
   });
 
+  it('emits backend warnings[] to stderr without polluting stdout JSON', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('BEARER = "eyJhbGciOi.eyJzdWIiOiJ4In0.sig"\n');
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          ...SAMPLE_RESPONSE,
+          type: 'backend',
+          warnings: [
+            'This test appears to hardcode an auth credential — read auth from __AUTH_HEADERS__.',
+          ],
+        },
+      };
+    });
+    const out: string[] = [];
+    const err: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'backend',
+        name: 'hardcoded be',
+        codeFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => err.push(line),
+      },
+    );
+    // Warning lands on stderr, prefixed `[warn]`.
+    expect(err.some(l => l.includes('[warn]') && l.includes('__AUTH_HEADERS__'))).toBe(true);
+    // stdout stays the parseable wire object — no warning noise.
+    expect(out.join('\n')).not.toContain('[warn]');
+  });
+
   it('respects a caller-supplied --idempotency-key (for safe retries)', async () => {
     const { credentialsPath } = makeCreds();
     const codeFile = writeCodeFile('code body');
@@ -5674,6 +5920,36 @@ describe('runCreate — M4 BE dependency authoring flags', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 
+  it('[FE guard] --produces rejection is well-formed: bare field, no ----produces, singular verb (dogfood 2026-06-30)', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('// fe code');
+    const err = (await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_fe',
+        type: 'frontend',
+        name: 'fe test',
+        codeFile,
+        produces: ['some_var'],
+      },
+      {
+        credentialsPath,
+        fetchImpl: () => Promise.resolve(new Response('{}')),
+        stdout: () => undefined,
+        stderr: () => undefined,
+      },
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    // details.field is the BARE flag name (was '--produces' → double-dashed subject).
+    expect(err.details).toMatchObject({ field: 'produces' });
+    expect(err.nextAction).toContain('--produces');
+    expect(err.nextAction).not.toContain('----'); // regression: '----produces'
+    expect(err.nextAction).toContain('is a backend-only flag'); // singular for one flag
+    expect(err.nextAction).not.toContain('backend..'); // regression: double period
+  });
+
   it('[FE guard] throws VALIDATION_ERROR exit 5 when --type frontend + --needs', async () => {
     const { credentialsPath } = makeCreds();
     const codeFile = writeCodeFile('// fe code');
@@ -6201,6 +6477,74 @@ describe('runUpdate', () => {
       { credentialsPath, fetchImpl, stdout: () => undefined },
     );
     expect(seenBody).toEqual({ priority: 'p2' });
+  });
+
+  it('threads --produces/--needs/--category into the PUT body with wire names', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: SAMPLE_RESPONSE };
+    });
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        produces: ['user_id', 'order_id'],
+        needs: ['session_token'],
+        category: 'teardown',
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(seenBody).toEqual({
+      produces: ['user_id', 'order_id'],
+      consumes: ['session_token'],
+      category: 'teardown',
+    });
+  });
+
+  it('accepts a dependency-only update (not rejected as a no-op)', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: SAMPLE_RESPONSE };
+    });
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        category: 'teardown',
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(seenBody).toEqual({ category: 'teardown' });
+  });
+
+  it('omits empty dependency arrays from the body', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: SAMPLE_RESPONSE };
+    });
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        name: 'renamed',
+        produces: [],
+        needs: [],
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(seenBody).toEqual({ name: 'renamed' });
   });
 
   it('respects a caller-supplied --idempotency-key', async () => {

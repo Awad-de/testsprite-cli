@@ -22,6 +22,7 @@ import { emitDeprecationNotice } from '../lib/deprecate.js';
 import type { OutputMode } from '../lib/output.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptSecret } from '../lib/prompt.js';
+import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 
 export interface MeResponse {
   userId: string;
@@ -37,6 +38,11 @@ export interface MeResponse {
   email?: string;
   /** Human-readable display name for the bound account. Absent-safe (dogfood L1866). */
   displayName?: string;
+  /**
+   * Authoritative per-user V3 routing bit. Absent-safe: older backends omit it,
+   * so it is only rendered when present.
+   */
+  v3Enabled?: boolean;
 }
 
 export interface AuthDeps {
@@ -65,6 +71,17 @@ type CommonOptions = FactoryCommonOptions;
 
 interface ConfigureOptions extends CommonOptions {
   fromEnv: boolean;
+  /**
+   * When true and the active profile already has a saved API key, skip the
+   * interactive key prompt and proceed directly to the skill-install step.
+   * A CI-safe flag: lets `setup` run idempotently without prompting on
+   * machines that already have credentials (e.g. re-running setup to
+   * refresh the agent skill without re-entering the key).
+   *
+   * Ignored when an explicit `--api-key` or `--from-env` key source is
+   * provided -- those paths always overwrite, regardless of existing state.
+   */
+  skipIfConfigured?: boolean;
 }
 
 const DEFAULT_API_URL = 'https://api.testsprite.com';
@@ -125,9 +142,23 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
     apiKey = env.TESTSPRITE_API_KEY?.trim();
     if (!apiKey) throw validationError('TESTSPRITE_API_KEY', FROM_ENV_MISSING_KEY);
   } else {
+    // --skip-if-configured: when a non-empty API key is already saved for
+    // this profile, skip the interactive prompt and return early. The
+    // key is NOT re-validated via GET /me on this path -- the caller
+    // (runInit) only reaches this when no explicit key source was given,
+    // and the subsequent whoami call in runInit will surface an expired
+    // key to the user anyway.
+    if (opts.skipIfConfigured && existingProfile?.apiKey) {
+      out.print({ profile: opts.profile, apiUrl, status: 'already_configured' }, data => {
+        const d = data as { profile: string; apiUrl: string };
+        return `Profile "${d.profile}" already configured. Endpoint: ${d.apiUrl}`;
+      });
+      return;
+    }
+
     const promptApi = deps.prompt ?? { secret: (q: string) => promptSecret(q) };
     prelude(`Configuring profile "${opts.profile}".\n`);
-    // Only the API key is prompted — the endpoint defaults to prod (see above).
+    // Only the API key is prompted -- the endpoint defaults to prod (see above).
     apiKey = (await promptApi.secret('TestSprite API key: ')).trim();
     if (!apiKey) throw new CLIError('No API key provided.', 5);
   }
@@ -201,6 +232,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
 export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promise<MeResponse> {
   const out = makeOutput(opts.output, deps);
   const env = deps.env ?? process.env;
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   // Resolve the endpoint URL so it can be surfaced in text output.
   // Dry-run uses the flag/env/default chain without touching credentials.
@@ -244,6 +276,8 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
       `endpoint: ${resolvedEndpoint}`,
       `env:    ${m.env}`,
       `scopes: ${m.scopes.join(', ')}`,
+      // Authoritative routing mode, rendered only when the backend supplies it.
+      ...(m.v3Enabled !== undefined ? [`routing: ${routingLabel(m.v3Enabled)}`] : []),
     ];
     // C2: warn in text mode when key cannot write/run
     const missingScopes = (['write:tests', 'run:tests'] as const).filter(
@@ -256,6 +290,11 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
     }
     return lines.join('\n');
   });
+  // When V3 routing is on, warn (text mode only) about the still-open behavior
+  // gaps. JSON consumers read `v3Enabled` directly; stdout stays pure.
+  if (opts.output !== 'json' && me.v3Enabled === true) {
+    emitV3RoutingAdvisory(stderr);
+  }
   return me;
 }
 

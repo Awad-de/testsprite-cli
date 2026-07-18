@@ -9,6 +9,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, CLIError } from '../lib/errors.js';
 import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
+import { readProfile, writeProfile } from '../lib/credentials.js';
 import type { MeResponse } from './auth.js';
 import type { AgentFs } from './agent.js';
 import type { InitDeps } from './init.js';
@@ -199,8 +200,14 @@ describe('runInit — happy path (interactive)', () => {
     const stdout = captured.stdout.join('\n');
     expect(stdout).toContain('TestSprite initialized.');
     expect(stdout).toContain('profile:');
+    // Next steps leads with creating a project; no command that fails without --project.
     expect(stdout).toContain('Next steps:');
-    expect(stdout).toContain('testsprite test list');
+    expect(stdout).toContain('testsprite project create --type frontend');
+    expect(stdout).toContain('testsprite test run --all --project <projectId>');
+    expect(stdout).toContain('the testsprite-onboard skill is installed');
+    // No "current project" wording, no bare test list.
+    expect(stdout).not.toContain('current project');
+    expect(stdout).not.toContain('testsprite test list');
   });
 
   it('json mode: emits structured InitSummary object', async () => {
@@ -230,6 +237,45 @@ describe('runInit — happy path (interactive)', () => {
     expect(agent.action).toBe('installed');
     expect(agent.skills).toContain('testsprite-verify');
     expect(agent.skills).toContain('testsprite-onboard');
+  });
+
+  it('debug mode reports a display-only whoami lookup failure without corrupting JSON stdout', async () => {
+    const { captured, deps } = makeCapture();
+    let callCount = 0;
+    const fetchMock = vi.fn(async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        return new Response(JSON.stringify(ME), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          error: {
+            code: 'AUTH_INVALID',
+            message: 'Invalid API key',
+            nextAction: 'Provide a valid key.',
+            requestId: 'r-whoami',
+          },
+        }),
+        { status: 401, headers: { 'content-type': 'application/json' } },
+      );
+    }) as unknown as InitDeps['fetchImpl'];
+
+    await runInit(
+      makeBaseOpts({ apiKey: 'sk-json-test', debug: true, noAgent: true, output: 'json' }),
+      {
+        ...deps,
+        fetchImpl: fetchMock,
+        credentialsPath,
+        isTTY: false,
+      },
+    );
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
+    expect(parsed.status).toBe('initialized');
+    expect(captured.stderr.some(line => line.includes('setup identity lookup failed'))).toBe(true);
   });
 });
 
@@ -306,6 +352,15 @@ describe('runInit — --no-agent', () => {
 
     const stdout = captured.stdout.join('\n');
     expect(stdout).toContain('skipped (--no-agent)');
+    // --no-agent points at manual test creation; must not claim the skill is installed.
+    expect(stdout).toContain('Next steps:');
+    expect(stdout).toContain('testsprite project create --type frontend');
+    expect(stdout).toContain('testsprite test create --project <projectId>');
+    expect(stdout).toContain('testsprite test run --all --project <projectId>');
+    expect(stdout).not.toContain('skill is installed');
+    // No "current project" wording, no bare test list.
+    expect(stdout).not.toContain('current project');
+    expect(stdout).not.toContain('testsprite test list');
   });
 
   it('text mode with agent: summary contains skills line with both default skills', async () => {
@@ -989,5 +1044,101 @@ describe('runInit — telemetry attribution (X-CLI-Command)', () => {
     // Exactly one carries the tag → the backend emits exactly one cli.initialized
     // (no double-count); the whoami /me stays cli.session_started.
     expect(initTagged).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runInit -- skipIfConfigured
+// ---------------------------------------------------------------------------
+
+describe('runInit -- skipIfConfigured', () => {
+  it('skips the API key prompt and reuses saved credentials when the profile exists', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    // Write a saved key before running setup.
+    writeProfile('default', { apiKey: 'sk-saved' }, { path: credentialsPath });
+    // Provide a mock fetch that accepts /me so runWhoami (identity banner) succeeds.
+    const fetchMock = makeOkFetch();
+    const prompt = { secret: vi.fn(async () => 'sk-should-never-be-asked') };
+
+    await runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+      ...deps,
+      credentialsPath,
+      fetchImpl: fetchMock,
+      fs: agentFs,
+      isTTY: false,
+      prompt,
+    });
+
+    // The prompt must never have fired.
+    expect(prompt.secret).not.toHaveBeenCalled();
+    // The saved key must be untouched.
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-saved');
+    // The summary must still be emitted.
+    const parsed = JSON.parse(captured.stdout.join('')) as { status: string };
+    expect(parsed.status).toBe('initialized');
+  });
+
+  it('proceeds to prompt when skipIfConfigured is true but no credentials exist', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    // No pre-existing credentials -- skip has no effect.
+    const fetchMock = makeOkFetch();
+    const prompt = { secret: vi.fn(async () => 'sk-fresh') };
+
+    await runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'text' }), {
+      ...deps,
+      credentialsPath,
+      fetchImpl: fetchMock,
+      fs: agentFs,
+      isTTY: true,
+      prompt,
+    });
+
+    // With no saved key, the prompt should fire.
+    expect(prompt.secret).toHaveBeenCalledTimes(1);
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-fresh');
+    expect(captured.stdout.join('')).toContain('initialized');
+  });
+
+  it('allows non-interactive (isTTY=false) when skipIfConfigured is true and credentials exist', async () => {
+    const { deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    writeProfile('default', { apiKey: 'sk-ci' }, { path: credentialsPath });
+    const fetchMock = makeOkFetch();
+
+    // Must not throw exit 5 for "non-interactive mode, no key source".
+    await expect(
+      runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+        ...deps,
+        credentialsPath,
+        fetchImpl: fetchMock,
+        fs: agentFs,
+        isTTY: false,
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-ci');
+  });
+
+  it('--api-key takes precedence over skipIfConfigured and overwrites the saved key', async () => {
+    const { deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    writeProfile('default', { apiKey: 'sk-old' }, { path: credentialsPath });
+    const fetchMock = makeOkFetch();
+
+    await runInit(
+      makeBaseOpts({ apiKey: 'sk-new', skipIfConfigured: true, noAgent: true, output: 'text' }),
+      {
+        ...deps,
+        credentialsPath,
+        fetchImpl: fetchMock,
+        fs: agentFs,
+        isTTY: false,
+      },
+    );
+
+    // Explicit --api-key must overwrite regardless of skipIfConfigured.
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-new');
   });
 });

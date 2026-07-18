@@ -7,7 +7,8 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { ApiError } from './errors.js';
+import { ApiError, InterruptError } from './errors.js';
+import { ShutdownController } from './interrupt.js';
 import { pollRunUntilTerminal, TimeoutError } from './poll.js';
 import type { RunClient } from './poll.js';
 import type { RunResponse } from './runs.types.js';
@@ -792,5 +793,106 @@ describe('pollRunUntilTerminal — resolveAlternate hook', () => {
     } finally {
       Date.now = realDateNow;
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Graceful detach — shutdown handle (DEV-331 piece 1)
+// ---------------------------------------------------------------------------
+
+describe('pollRunUntilTerminal — shutdown (SIGINT/SIGTERM graceful detach)', () => {
+  it('throws the InterruptError when the shutdown signal was already aborted (beats the deadline)', async () => {
+    const shutdown = new ShutdownController();
+    shutdown.interrupt('SIGINT');
+    // timeoutSeconds 0 → the deadline has also passed; the interrupt must win.
+    const err = await pollRunUntilTerminal(makeClient([makeRun('passed')]), RUN_ID, {
+      timeoutSeconds: 0,
+      sleep: instantSleep,
+      shutdown,
+    }).catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect((err as InterruptError).signal).toBe('SIGINT');
+  });
+
+  it('aborts an in-flight long-poll fetch and surfaces InterruptError (not TimeoutError)', async () => {
+    // getRun hangs until the composed per-iteration signal aborts — the same
+    // contract as a real fetch. Flag-checking between iterations would never
+    // notice; only the signal composition can interrupt this.
+    const client: RunClient = {
+      getRun: (_runId, opts) =>
+        new Promise((_resolve, reject) => {
+          opts?.signal?.addEventListener('abort', () => reject(opts.signal!.reason), {
+            once: true,
+          });
+        }),
+    };
+    const shutdown = new ShutdownController();
+    const poll = pollRunUntilTerminal(client, RUN_ID, {
+      timeoutSeconds: 30,
+      sleep: instantSleep,
+      shutdown,
+    });
+    queueMicrotask(() => shutdown.interrupt('SIGINT'));
+    const err = await poll.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect((err as InterruptError).signal).toBe('SIGINT');
+    expect((err as InterruptError).exitCode).toBe(130);
+  });
+
+  it('bails out of a retryAfterSeconds sleep immediately on interrupt', async () => {
+    // The injected sleep never resolves — only the shutdown race can end it.
+    const neverSleep = () => new Promise<void>(() => {});
+    const client = makeClient([makeRun('running', { retryAfterSeconds: 60 }), makeRun('running')]);
+    const shutdown = new ShutdownController();
+    const poll = pollRunUntilTerminal(client, RUN_ID, {
+      timeoutSeconds: 300,
+      sleep: neverSleep,
+      shutdown,
+    });
+    await new Promise(resolve => setTimeout(resolve, 10)); // let the loop reach the sleep
+    shutdown.interrupt('SIGTERM');
+    const err = await poll.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect((err as InterruptError).signal).toBe('SIGTERM');
+    expect((err as InterruptError).exitCode).toBe(143);
+  });
+
+  it('arms the graceful-detach scope for the poll duration and disarms after', async () => {
+    let armed = 0;
+    let disposedCount = 0;
+    const handle = {
+      signal: new AbortController().signal,
+      arm: () => {
+        armed += 1;
+        return () => {
+          disposedCount += 1;
+        };
+      },
+    };
+    const run = await pollRunUntilTerminal(makeClient([makeRun('passed')]), RUN_ID, {
+      timeoutSeconds: 5,
+      sleep: instantSleep,
+      shutdown: handle,
+    });
+    expect(run.status).toBe('passed');
+    expect(armed).toBe(1);
+    expect(disposedCount).toBe(1);
+  });
+
+  it('disarms even when the poll throws (TimeoutError path)', async () => {
+    let disposedCount = 0;
+    const handle = {
+      signal: new AbortController().signal,
+      arm: () => () => {
+        disposedCount += 1;
+      },
+    };
+    const err = await pollRunUntilTerminal(makeClient([makeRun('running')]), RUN_ID, {
+      timeoutSeconds: 0,
+      sleep: instantSleep,
+      shutdown: handle,
+    }).catch(e => e);
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect(disposedCount).toBe(1);
   });
 });

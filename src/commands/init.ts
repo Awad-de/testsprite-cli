@@ -90,6 +90,12 @@ interface InitOptions extends CommonOptions {
   force: boolean;
   dir?: string;
   yes: boolean;
+  /**
+   * When true and the active profile already has a saved API key, skip the
+   * interactive key prompt. Forwarded verbatim to runConfigure. Has no
+   * effect when --api-key or --from-env is also given.
+   */
+  skipIfConfigured?: boolean;
   /** Set by the command action when both --agent and --no-agent appear in rawArgs. */
   rawArgConflict?: boolean;
 }
@@ -196,9 +202,16 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   // -------------------------------------------------------------------------
   const isTTY = deps.isTTY ?? Boolean(process.stdin.isTTY);
   const hasKeySource = Boolean(opts.apiKey) || opts.fromEnv;
+  // --skip-if-configured counts as a key source when a saved key already exists:
+  // runConfigure will short-circuit before prompting, so no TTY is needed.
+  const credentialsPath = deps.credentialsPath;
+  const savedKey = credentialsPath
+    ? readProfile(opts.profile, { path: credentialsPath })?.apiKey
+    : readProfile(opts.profile)?.apiKey;
+  const skipWillApply = Boolean(opts.skipIfConfigured) && Boolean(savedKey) && !hasKeySource;
   // Non-interactive guard: no TTY + no key source → exit 5. Skipped under
   // --dry-run, which is documented to work without credentials or network.
-  if (!isTTY && !hasKeySource && !opts.dryRun) {
+  if (!isTTY && !hasKeySource && !skipWillApply && !opts.dryRun) {
     throw new CLIError(
       'No API key available in non-interactive mode. ' +
         'Pass --api-key <key>, --from-env (reads TESTSPRITE_API_KEY), or run interactively.',
@@ -208,7 +221,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   // JSON-output guard: an interactive secret prompt writes to stdout and would
   // corrupt init's single-JSON-object output contract. In --output json mode
   // require a non-interactive key source. Skipped under --dry-run (never prompts).
-  if (opts.output === 'json' && !hasKeySource && !opts.dryRun) {
+  if (opts.output === 'json' && !hasKeySource && !skipWillApply && !opts.dryRun) {
     throw new CLIError(
       'Interactive API-key prompt is unavailable in --output json mode (it would corrupt JSON stdout). ' +
         'Pass --api-key <key> or --from-env.',
@@ -223,7 +236,13 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     stderrFn('[dry-run] no writes or network calls — preview only');
     stderrFn(
       `[dry-run] would configure profile="${opts.profile}" (key source: ${
-        opts.apiKey ? 'flag' : opts.fromEnv ? 'env' : 'prompt'
+        opts.apiKey
+          ? 'flag'
+          : opts.fromEnv
+            ? 'env'
+            : opts.skipIfConfigured
+              ? 'skip-if-configured'
+              : 'prompt'
       })`,
     );
 
@@ -265,7 +284,12 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   // force fromEnv=false so runConfigure uses the injected key (toAuthDeps wires it
   // as the prompt) instead of reading TESTSPRITE_API_KEY from the environment (codex).
   await runConfigure(
-    { ...opts, fromEnv: opts.apiKey ? false : opts.fromEnv },
+    {
+      ...opts,
+      fromEnv: opts.apiKey ? false : opts.fromEnv,
+      // --api-key always overwrites; skip only applies when no explicit key source was given.
+      skipIfConfigured: opts.apiKey ? false : opts.skipIfConfigured,
+    },
     // commandTag:'init' tags ONLY this configure-validate GET /me with
     // `X-CLI-Command: init` → counted as cli.initialized. The whoami banner call
     // below builds deps WITHOUT a tag, so init emits exactly one cli.initialized.
@@ -291,9 +315,13 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   let me: MeResponse;
   try {
     me = await runWhoami(opts, whoamiDeps);
-  } catch {
+  } catch (err) {
     // Whoami is display-only. If it fails after a successful configure,
     // continue with a minimal placeholder so the summary still prints.
+    if (opts.debug) {
+      const reason = err instanceof Error ? err.message : String(err);
+      stderrFn(`[debug] setup identity lookup failed after configure: ${reason}`);
+    }
     me = { userId: '', keyId: '', scopes: [], env: 'production' };
   }
 
@@ -407,12 +435,33 @@ function renderInitText(data: unknown): string {
   }
   lines.push('');
   lines.push('Next steps:');
-  lines.push('  testsprite test list            # list tests in the current project');
-  lines.push('  testsprite agent list           # check installed agent targets');
+  lines.push('  # 1. Create your first project (frontend example) — prints a projectId');
+  lines.push(
+    '  testsprite project create --type frontend --name "My App" --url https://your-app.com',
+  );
+  lines.push('');
   if (s.agent) {
     lines.push(
-      '  testsprite agent install --target=<t>  # re-install or install additional targets',
+      '  # 2. Generate tests: ask your coding agent (the testsprite-onboard skill is installed),',
     );
+    lines.push('  #    or create one yourself, then run them (use the projectId from step 1):');
+    lines.push('  testsprite test run --all --project <projectId>');
+    lines.push('');
+    lines.push('  # Manage installed agent skills');
+    lines.push('  testsprite agent list');
+    lines.push(
+      '  testsprite agent install --target=<t>   # re-install or install additional targets',
+    );
+  } else {
+    lines.push('  # 2. Create a test, then run it (use the projectId from step 1):');
+    lines.push('  testsprite test create --project <projectId> ...');
+    lines.push('  testsprite test run --all --project <projectId>');
+    lines.push(
+      '  # Tip: `testsprite agent install` sets up the onboarding skill for your coding agent',
+    );
+    lines.push('');
+    lines.push('  # Manage installed agent skills');
+    lines.push('  testsprite agent list');
   }
 
   return lines.join('\n');
@@ -454,6 +503,7 @@ interface SetupCmdOpts {
   force?: boolean;
   dir?: string;
   yes?: boolean;
+  skipIfConfigured?: boolean;
 }
 
 /** Attach the onboarding flags shared by `setup` and the `init` alias. */
@@ -477,7 +527,11 @@ function addSetupOptions(
     .option('--no-agent', 'Skip the agent skill install (configure credentials only)')
     .option('--force', 'Overwrite an existing skill file (a .bak backup is kept)')
     .option('--dir <path>', 'Project root for the skill install (default: current directory)')
-    .option('-y, --yes', 'Non-interactive: accept all defaults, never prompt');
+    .option('-y, --yes', 'Non-interactive: accept all defaults, never prompt')
+    .option(
+      '--skip-if-configured',
+      'Skip the API key prompt when credentials already exist for this profile (CI-safe idempotent re-run)',
+    );
 }
 
 /** Build {@link InitOptions} from raw Commander opts + globals. */
@@ -518,6 +572,7 @@ function buildSetupOptions(
     force: Boolean(cmdOpts.force),
     dir: cmdOpts.dir,
     yes: Boolean(cmdOpts.yes),
+    skipIfConfigured: Boolean(cmdOpts.skipIfConfigured),
     rawArgConflict,
   };
 }

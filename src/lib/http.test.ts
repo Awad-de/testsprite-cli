@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ApiError, RequestTimeoutError, TransportError } from './errors.js';
+import { ApiError, InterruptError, RequestTimeoutError, TransportError } from './errors.js';
 import type { DebugEvent } from './http.js';
 import { HttpClient, REQUEST_TIMEOUT_DEFAULT_MS, buildUrl, parseRetryAfter } from './http.js';
 import { VERSION } from '../version.js';
@@ -29,7 +29,11 @@ function errorEnvelopeResponse(status: number, code: string, init: ResponseInit 
 
 function makeClient(
   fetchImpl: typeof fetch,
-  options: { apiKey?: string | null; onDebug?: (e: DebugEvent) => void } = {},
+  options: {
+    apiKey?: string | null;
+    onDebug?: (e: DebugEvent) => void;
+    onServerVersion?: (info: { minVersion?: string }) => void;
+  } = {},
 ): HttpClient {
   const apiKey = 'apiKey' in options ? (options.apiKey ?? undefined) : 'sk-test';
   return new HttpClient({
@@ -39,8 +43,72 @@ function makeClient(
     sleep: () => Promise.resolve(),
     random: () => 0,
     onDebug: options.onDebug,
+    onServerVersion: options.onServerVersion,
   });
 }
+
+describe('CLIENT_TOO_OLD (426)', () => {
+  it('is not retried — fails fast with the typed error', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(errorEnvelopeResponse(426, 'CLIENT_TOO_OLD'));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+
+    const err = await client.get('/me').catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('CLIENT_TOO_OLD');
+    expect((err as ApiError).exitCode).toBe(14);
+    expect(fetchImpl).toHaveBeenCalledTimes(1); // no retry
+  });
+});
+
+describe('onServerVersion hook', () => {
+  it('fires with the parsed floor header on a 2xx response', async () => {
+    const onServerVersion = vi.fn();
+    const fetchImpl = vi.fn().mockResolvedValue(
+      jsonResponse(
+        { ok: true },
+        {
+          headers: {
+            'content-type': 'application/json',
+            'x-testsprite-cli-min-version': '1.0.0',
+          },
+        },
+      ),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch, { onServerVersion });
+
+    await client.get('/me');
+
+    expect(onServerVersion).toHaveBeenCalledWith({ minVersion: '1.0.0' });
+  });
+
+  it('fires on a non-2xx response too (the floor header rides on every response)', async () => {
+    const onServerVersion = vi.fn();
+    const fetchImpl = vi.fn().mockResolvedValue(
+      errorEnvelopeResponse(404, 'NOT_FOUND', {
+        headers: {
+          'content-type': 'application/json',
+          'x-testsprite-cli-min-version': '1.0.0',
+        },
+      }),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch, { onServerVersion });
+
+    await client.get('/tests/missing').catch(() => undefined);
+
+    expect(onServerVersion).toHaveBeenCalledWith({ minVersion: '1.0.0' });
+  });
+
+  it('does not fire when the floor header is absent', async () => {
+    const onServerVersion = vi.fn();
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch, { onServerVersion });
+
+    await client.get('/me');
+
+    expect(onServerVersion).not.toHaveBeenCalled();
+  });
+});
 
 describe('buildUrl', () => {
   it('handles trailing slashes and absolute paths', () => {
@@ -260,6 +328,31 @@ describe('HttpClient error mapping', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(4);
   });
 
+  it('does not retry transport errors for keyless writes', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('ECONNRESET');
+    });
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.post('/projects', { body: { name: 'Checkout' } })).rejects.toBeInstanceOf(
+      TransportError,
+    );
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries transport errors for writes with an idempotency key', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('ECONNRESET');
+    });
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(
+      client.post('/projects', {
+        body: { name: 'Checkout' },
+        headers: { 'Idempotency-Key': 'op_123' },
+      }),
+    ).rejects.toBeInstanceOf(TransportError);
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
   it('does not retry AbortError', async () => {
     const fetchImpl = vi.fn(async () => {
       const err = new Error('aborted');
@@ -330,6 +423,27 @@ describe('HttpClient transport-edge statuses', () => {
       expect(fetchImpl).toHaveBeenCalledTimes(4);
     },
   );
+
+  it('does not retry bare transport-edge responses for keyless writes', async () => {
+    const fetchImpl = vi.fn(async () => new Response('proxy gateway html', { status: 502 }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.post('/projects', { body: { name: 'Checkout' } })).rejects.toBeInstanceOf(
+      TransportError,
+    );
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries bare transport-edge responses for writes with an idempotency key', async () => {
+    const fetchImpl = vi.fn(async () => new Response('proxy gateway html', { status: 502 }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(
+      client.post('/projects', {
+        body: { name: 'Checkout' },
+        headers: { 'idempotency-key': 'op_123' },
+      }),
+    ).rejects.toBeInstanceOf(TransportError);
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
 
   it('502 carrying our envelope still maps to its catalog code', async () => {
     const body = {
@@ -639,5 +753,179 @@ describe('HttpClient per-request timeout', () => {
     });
     const err = await client.get('/me').catch(e => e);
     expect(err).toBeInstanceOf(RequestTimeoutError);
+  });
+});
+
+describe('HttpClient shutdown signal (DEV-331 graceful detach)', () => {
+  /** Stalled fetch that rejects with the effective signal's reason on abort. */
+  function stalledFetch(callCounter?: { count: number }): typeof fetch {
+    return vi.fn(async (_input: unknown, init?: { signal?: AbortSignal }) => {
+      if (callCounter) callCounter.count += 1;
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        const rejectWithReason = (): void => {
+          const reason: unknown = signal?.reason;
+          if (reason instanceof Error) {
+            reject(reason);
+            return;
+          }
+          const err = new Error('aborted');
+          err.name = 'AbortError';
+          reject(err);
+        };
+        if (signal?.aborted) {
+          rejectWithReason();
+          return;
+        }
+        signal?.addEventListener('abort', rejectWithReason, { once: true });
+      });
+    }) as unknown as typeof fetch;
+  }
+
+  function makeShutdownClient(
+    shutdownSignal: AbortSignal,
+    callCounter?: { count: number },
+  ): HttpClient {
+    return new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl: stalledFetch(callCounter),
+      sleep: () => Promise.resolve(),
+      random: () => 0,
+      shutdownSignal,
+    });
+  }
+
+  it('aborts an in-flight fetch with the InterruptError reason (no retry, no re-wrap)', async () => {
+    const counter = { count: 0 };
+    const shutdown = new AbortController();
+    const client = makeShutdownClient(shutdown.signal, counter);
+    const pending = client.get('/runs/run_1');
+    queueMicrotask(() => shutdown.abort(new InterruptError('SIGINT')));
+    const err = await pending.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect((err as InterruptError).signal).toBe('SIGINT');
+    expect((err as InterruptError).exitCode).toBe(130);
+    expect(counter.count).toBe(1); // never retried
+  });
+
+  it('classifies an anonymous AbortError as the interrupt when the shutdown signal fired', async () => {
+    // Some runtimes reject with a bare AbortError instead of the abort reason;
+    // rethrowIfAbort must still classify shutdown-first (never TransportError,
+    // never RequestTimeoutError).
+    const shutdown = new AbortController();
+    const fetchImpl = vi.fn(async (_input: unknown, init?: { signal?: AbortSignal }) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          'abort',
+          () => {
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            reject(err);
+          },
+          { once: true },
+        );
+      });
+    }) as unknown as typeof fetch;
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl,
+      sleep: () => Promise.resolve(),
+      random: () => 0,
+      shutdownSignal: shutdown.signal,
+    });
+    const pending = client.get('/runs/run_1');
+    queueMicrotask(() => shutdown.abort(new InterruptError('SIGTERM')));
+    const err = await pending.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect((err as InterruptError).signal).toBe('SIGTERM');
+  });
+
+  it('skips dispatch entirely when the shutdown signal is already aborted', async () => {
+    const counter = { count: 0 };
+    const shutdown = new AbortController();
+    shutdown.abort(new InterruptError('SIGINT'));
+    const client = makeShutdownClient(shutdown.signal, counter);
+    const err = await client.get('/me').catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect(counter.count).toBe(0);
+  });
+
+  it('passes an InterruptError from a caller-composed signal through untouched (poll path, no shutdownSignal configured)', async () => {
+    // The polling loop composes the shutdown signal into its per-iteration
+    // caller signal; the fetch then rejects with the InterruptError reason
+    // even though the client itself has no shutdownSignal.
+    const counter = { count: 0 };
+    const fetchImpl = stalledFetch(counter);
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl,
+      sleep: () => Promise.resolve(),
+      random: () => 0,
+    });
+    const caller = new AbortController();
+    const pending = client.get('/runs/run_1', { signal: caller.signal });
+    queueMicrotask(() => caller.abort(new InterruptError('SIGINT')));
+    const err = await pending.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect(counter.count).toBe(1); // no transport retry
+  });
+});
+
+describe('HttpClient retry-delay sleep bails on shutdown (DEV-331 codex finding 1)', () => {
+  it('a shutdown during a transport-retry sleep rejects with InterruptError immediately', async () => {
+    // First fetch throws a transport error → the client schedules a retry
+    // sleep. The injected sleep NEVER resolves, so only the shutdown race can
+    // end it — without the bail, the interrupt would wait out the delay
+    // (e.g. a Retry-After: 60) before surfacing.
+    const shutdown = new AbortController();
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      throw new Error('socket hang up');
+    }) as unknown as typeof fetch;
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl,
+      sleep: () => new Promise<void>(() => {}), // never resolves
+      random: () => 0,
+      shutdownSignal: shutdown.signal,
+    });
+    const pending = client.get('/me');
+    // Let the first attempt fail and the retry sleep begin, then interrupt.
+    await new Promise(resolve => setTimeout(resolve, 10));
+    shutdown.abort(new InterruptError('SIGINT'));
+    const err = await pending.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect(calls).toBe(1); // the retry never dispatched
+  });
+
+  it('a shutdown during a RATE_LIMITED Retry-After sleep rejects with InterruptError immediately', async () => {
+    const shutdown = new AbortController();
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      return errorEnvelopeResponse(429, 'RATE_LIMITED', {
+        headers: { 'content-type': 'application/json', 'retry-after': '60' },
+      });
+    }) as unknown as typeof fetch;
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl,
+      sleep: () => new Promise<void>(() => {}), // never resolves
+      random: () => 0,
+      shutdownSignal: shutdown.signal,
+    });
+    const pending = client.get('/me');
+    await new Promise(resolve => setTimeout(resolve, 10));
+    shutdown.abort(new InterruptError('SIGTERM'));
+    const err = await pending.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect((err as InterruptError).signal).toBe('SIGTERM');
+    expect(calls).toBe(1);
   });
 });

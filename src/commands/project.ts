@@ -12,6 +12,7 @@ import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { assertNotLocal } from '../lib/target-url.js';
+import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
 import {
   fetchSinglePage,
@@ -44,6 +45,8 @@ interface ListOptions extends CommonOptions {
   pageSize?: number;
   startingToken?: string;
   maxItems?: number;
+  columns?: string;
+  noHeader?: boolean;
 }
 
 export async function runList(
@@ -57,6 +60,9 @@ export async function runList(
     startingToken: opts.startingToken,
     maxItems: opts.maxItems,
   });
+  if (opts.output === 'text') {
+    resolveTextColumns(opts.columns, PROJECT_LIST_COLUMNS);
+  }
   const client = makeClient(opts, deps);
 
   // When the user explicitly passed a page-size flag and did NOT ask
@@ -84,7 +90,7 @@ export async function runList(
 
   out.print(page, data => {
     const p = data as Page<CliProject>;
-    return renderProjectListText(p);
+    return renderProjectListText(p, { columns: opts.columns, noHeader: opts.noHeader });
   });
   return page;
 }
@@ -110,7 +116,8 @@ export interface CliCreateProjectRequest {
   type: 'frontend' | 'backend';
   name: string;
   targetUrl?: string;
-  description?: string;
+  // `description` is intentionally not part of the wire request — projects have
+  // no description field. The `--description` flag is rejected client-side.
   username?: string;
   password?: string;
   instruction?: string;
@@ -142,24 +149,25 @@ export async function runCreate(
   // (exit 10 UNAVAILABLE) — fail fast with a clear exit 5 instead.
   assertIdempotencyKey(opts.idempotencyKey);
 
-  // Reject empty / whitespace-only names so a junk record never reaches the
-  // backend — matches the `requireString` whitespace guard `test create` uses
-  // (dogfood P1 fix #1). Without this, `--name "   "` passes the action
-  // handler's `if (!name)` check (a non-empty string is truthy) and is sent
-  // verbatim, creating a blank-named project.
-  if (opts.name !== undefined && opts.name.trim().length === 0) {
-    throw localValidationError('--name must not be empty or whitespace-only');
+  // P1-3: client-side length checks matching server limits.
+  // Whitespace-only / empty rejection (parity with `test create`'s requireString;
+  // a truthy `--name "   "` otherwise creates a blank-named project on the backend).
+  if (opts.name === undefined || opts.name.trim().length === 0) {
+    throw localValidationError('--name is required and must not be empty or whitespace-only');
   }
   if (opts.password !== undefined && opts.password.trim().length === 0) {
     throw localValidationError('--password must not be empty or whitespace-only');
   }
-
-  // P1-3: client-side length checks matching server limits.
-  if (opts.name !== undefined && opts.name.length > 200) {
+  if (opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
   }
-  if (opts.description !== undefined && opts.description.length > 2000) {
-    throw localValidationError('--description must be at most 2000 characters');
+  // `--description` is not supported on projects — no project entity stores a
+  // description, and the backend rejects it with a 422. Fail fast client-side
+  // with an actionable message instead of a wasted round trip.
+  if (opts.description !== undefined) {
+    throw localValidationError(
+      '--description is not supported for projects; omit it (test-level descriptions are set on `test create`)',
+    );
   }
 
   // P2-7: guard --url against localhost/RFC1918/non-http(s) (same rules as
@@ -214,7 +222,6 @@ export async function runCreate(
     type: opts.type,
     name: opts.name,
     ...(opts.targetUrl !== undefined ? { targetUrl: opts.targetUrl } : {}),
-    ...(opts.description !== undefined ? { description: opts.description } : {}),
     ...(opts.username !== undefined ? { username: opts.username } : {}),
     ...(password !== undefined ? { password } : {}),
     ...(opts.instruction !== undefined ? { instruction: opts.instruction } : {}),
@@ -248,7 +255,6 @@ interface UpdateOptions extends CommonOptions {
   username?: string;
   password?: string;
   passwordFile?: string;
-  description?: string;
   instruction?: string;
   idempotencyKey?: string;
 }
@@ -264,6 +270,8 @@ export async function runUpdate(
   assertIdempotencyKey(opts.idempotencyKey);
 
   // P1-3: client-side length checks matching server limits.
+  // Reject a whitespace-only `--name` on update too (parity with create); name
+  // stays optional here, so only validate when the flag is supplied.
   if (opts.name !== undefined && opts.name.trim().length === 0) {
     throw localValidationError('--name must not be empty or whitespace-only');
   }
@@ -273,10 +281,6 @@ export async function runUpdate(
   if (opts.name !== undefined && opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
   }
-  if (opts.description !== undefined && opts.description.length > 2000) {
-    throw localValidationError('--description must be at most 2000 characters');
-  }
-
   // P2-7: guard --url against localhost/RFC1918/non-http(s).
   if (opts.targetUrl !== undefined) {
     assertNotLocal(opts.targetUrl);
@@ -288,7 +292,6 @@ export async function runUpdate(
     targetUrl: opts.targetUrl !== undefined,
     username: opts.username !== undefined,
     password: passwordSupplied,
-    description: opts.description !== undefined,
     instruction: opts.instruction !== undefined,
   };
   const presentFieldNames = Object.entries(mutableFields)
@@ -296,7 +299,7 @@ export async function runUpdate(
     .map(([field]) => field);
   if (presentFieldNames.length === 0) {
     throw localValidationError(
-      'At least one mutable flag is required: --name, --url, --username, --password/--password-file, --description, or --instruction.',
+      'At least one mutable flag is required: --name, --url, --username, --password/--password-file, or --instruction.',
     );
   }
 
@@ -336,7 +339,6 @@ export async function runUpdate(
     targetUrl: opts.targetUrl,
     username: opts.username,
     password,
-    description: opts.description,
     instruction: opts.instruction,
   };
   const body = Object.fromEntries(
@@ -355,6 +357,302 @@ export async function runUpdate(
   return updated;
 }
 
+// ---------------------------------------------------------------------------
+// project delete
+// ---------------------------------------------------------------------------
+
+export interface CliDeleteProjectResponse {
+  projectId: string;
+  deletedAt: string;
+}
+
+interface DeleteOptions extends CommonOptions {
+  projectId: string;
+  /** Hard gate — required (unless `--dry-run` is set). No interactive prompts. */
+  confirm: boolean;
+  /** Caller-supplied idempotency token; UUIDv4 minted client-side if absent. */
+  idempotencyKey?: string;
+}
+
+/**
+ * `project delete <project-id> --confirm` — permanent cascade delete via
+ * DELETE /projects/{id}.
+ *
+ * The server deletes the project together with everything under it — its
+ * frontend/backend sub-projects, all their tests, and backend fixtures —
+ * matching the Portal's own delete behavior. There is no restore window.
+ *
+ * **`--confirm` is required** (unless `--dry-run`). Without either, the CLI
+ * exits 5 `VALIDATION_ERROR` with a typed envelope explaining the convention.
+ * The CLI never prompts interactively (CI-friendly contract). Re-delete on an already-deleted (or missing) project returns 404 from
+ * the server; the CLI surfaces the envelope as-is (exit 4), no client branching.
+ */
+export async function runDelete(
+  opts: DeleteOptions,
+  deps: ProjectDeps = {},
+): Promise<CliDeleteProjectResponse> {
+  assertIdempotencyKey(opts.idempotencyKey);
+  if (opts.projectId === undefined || opts.projectId.trim().length === 0) {
+    throw localValidationError('<project-id> is required');
+  }
+
+  if (!opts.confirm && !opts.dryRun) {
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Refusing to delete without --confirm.',
+        nextAction:
+          'This permanently deletes the project and everything under it — its ' +
+          'sub-projects, all their tests, and backend fixtures (no restore window). ' +
+          'The CLI convention is explicit confirmation for destructive operations. ' +
+          'Re-run with --confirm. (--dry-run also works without --confirm.)',
+        requestId: 'local',
+        details: { field: 'confirm', reason: 'required for destructive operation' },
+      },
+    });
+  }
+
+  const idempotencyKey = opts.idempotencyKey ?? `cli-delete-${randomUUID()}`;
+  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
+    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    stderr(`idempotency-key: ${idempotencyKey}`);
+  }
+
+  const client = makeClient(opts, deps);
+  const out = makeOutput(opts.output, deps);
+  const response = await client.delete<CliDeleteProjectResponse>(
+    `/projects/${encodeURIComponent(opts.projectId)}`,
+    {
+      headers: { 'idempotency-key': idempotencyKey },
+    },
+  );
+
+  out.print(response, data => renderDeleteText(data as CliDeleteProjectResponse));
+  return response;
+}
+
+// ---------------------------------------------------------------------------
+// project credential — set the static backend credential
+// ---------------------------------------------------------------------------
+
+const CLI_AUTH_TYPES = ['public', 'Bearer token', 'API key', 'basic token'] as const;
+
+export interface CliProjectCredentialResponse {
+  projectId: string;
+  authType: string;
+  rewroteCount: number;
+}
+
+interface CredentialOptions extends CommonOptions {
+  projectId: string;
+  authType: string;
+  credential?: string;
+  credentialFile?: string;
+  idempotencyKey?: string;
+}
+
+export async function runCredential(
+  opts: CredentialOptions,
+  deps: ProjectDeps = {},
+): Promise<CliProjectCredentialResponse> {
+  const out = makeOutput(opts.output, deps);
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  assertIdempotencyKey(opts.idempotencyKey);
+
+  if (!(CLI_AUTH_TYPES as readonly string[]).includes(opts.authType)) {
+    throw localValidationError(`--type must be one of: ${CLI_AUTH_TYPES.join(', ')}`);
+  }
+
+  // Resolve the credential value (flag or file). Required for every type
+  // except `public` (which clears it).
+  let credential = opts.credential;
+  if (credential === undefined && opts.credentialFile !== undefined) {
+    credential = readFileSync(opts.credentialFile, 'utf8').trim();
+  }
+  if (opts.authType !== 'public' && (credential === undefined || credential === '')) {
+    throw localValidationError(
+      '--credential (or --credential-file) is required unless --type is "public"',
+    );
+  }
+
+  const body: Record<string, string> = { authType: opts.authType };
+  if (opts.authType !== 'public' && credential !== undefined) body.credential = credential;
+
+  const idempotencyKey = opts.idempotencyKey ?? `cli-proj-cred-${randomUUID()}`;
+  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
+    stderr(`idempotency-key: ${idempotencyKey}`);
+  }
+
+  if (opts.dryRun) {
+    const sample: CliProjectCredentialResponse = {
+      projectId: opts.projectId,
+      authType: opts.authType,
+      rewroteCount: 0,
+    };
+    out.print(sample, data => renderCredentialText(data as CliProjectCredentialResponse));
+    return sample;
+  }
+
+  const client = makeClient(opts, deps);
+  const res = await client.put<CliProjectCredentialResponse>(
+    `/projects/${encodeURIComponent(opts.projectId)}/credential`,
+    { body, headers: { 'idempotency-key': idempotencyKey } },
+  );
+  out.print(res, data => renderCredentialText(data as CliProjectCredentialResponse));
+  return res;
+}
+
+function renderCredentialText(r: CliProjectCredentialResponse): string {
+  return [
+    `projectId    ${r.projectId}`,
+    `authType     ${r.authType}`,
+    `rewroteCount ${r.rewroteCount}`,
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// project auto-auth — configure the recurring-token (auto-refresh) login
+// ---------------------------------------------------------------------------
+
+const AUTO_AUTH_METHODS = ['password', 'refresh_token', 'aws_cognito_refresh'] as const;
+const AUTO_AUTH_INJECTS = ['bearer', 'header', 'cookie'] as const;
+
+export interface CliProjectAutoAuthResponse {
+  projectId: string;
+  enabled: boolean;
+  method: string;
+  inject: string;
+  /**
+   * Present when the server's trial refresh failed: `enabled` is then `false`
+   * and this carries the reason (e.g. a bad refresh token). The config is still
+   * stored, but auto-auth won't run until the login succeeds.
+   */
+  lastRefreshError?: string;
+}
+
+interface AutoAuthOptions extends CommonOptions {
+  projectId: string;
+  disable?: boolean;
+  method: string;
+  inject: string;
+  injectKey?: string;
+  // password method
+  loginUrl?: string;
+  loginMethod?: string;
+  loginContentType?: string;
+  loginBodyTemplate?: string;
+  username?: string;
+  password?: string;
+  passwordFile?: string;
+  tokenPath?: string;
+  // refresh_token method
+  tokenEndpoint?: string;
+  clientId?: string;
+  clientSecret?: string;
+  clientSecretFile?: string;
+  refreshToken?: string;
+  refreshTokenFile?: string;
+  scope?: string;
+  // aws_cognito_refresh method
+  region?: string;
+  idempotencyKey?: string;
+}
+
+export async function runAutoAuth(
+  opts: AutoAuthOptions,
+  deps: ProjectDeps = {},
+): Promise<CliProjectAutoAuthResponse> {
+  const out = makeOutput(opts.output, deps);
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  assertIdempotencyKey(opts.idempotencyKey);
+
+  if (!(AUTO_AUTH_METHODS as readonly string[]).includes(opts.method)) {
+    throw localValidationError(`--method must be one of: ${AUTO_AUTH_METHODS.join(', ')}`);
+  }
+  if (!(AUTO_AUTH_INJECTS as readonly string[]).includes(opts.inject)) {
+    throw localValidationError(`--inject must be one of: ${AUTO_AUTH_INJECTS.join(', ')}`);
+  }
+
+  // Resolve secrets from --*-file variants so they stay out of shell history.
+  const password =
+    opts.password ??
+    (opts.passwordFile !== undefined ? readFileSync(opts.passwordFile, 'utf8').trim() : undefined);
+  const clientSecret =
+    opts.clientSecret ??
+    (opts.clientSecretFile !== undefined
+      ? readFileSync(opts.clientSecretFile, 'utf8').trim()
+      : undefined);
+  const refreshToken =
+    opts.refreshToken ??
+    (opts.refreshTokenFile !== undefined
+      ? readFileSync(opts.refreshTokenFile, 'utf8').trim()
+      : undefined);
+
+  const enabled = opts.disable !== true;
+  const body: Record<string, unknown> = { enabled, method: opts.method, inject: opts.inject };
+  const maybe = (k: string, v: string | undefined): void => {
+    if (v !== undefined) body[k] = v;
+  };
+  maybe('injectKey', opts.injectKey);
+  maybe('loginUrl', opts.loginUrl);
+  maybe('loginMethod', opts.loginMethod);
+  maybe('loginContentType', opts.loginContentType);
+  maybe('loginBodyTemplate', opts.loginBodyTemplate);
+  maybe('username', opts.username);
+  maybe('password', password);
+  maybe('tokenPath', opts.tokenPath);
+  maybe('tokenEndpoint', opts.tokenEndpoint);
+  maybe('clientId', opts.clientId);
+  maybe('clientSecret', clientSecret);
+  maybe('refreshToken', refreshToken);
+  maybe('scope', opts.scope);
+  maybe('region', opts.region);
+
+  const idempotencyKey = opts.idempotencyKey ?? `cli-proj-autoauth-${randomUUID()}`;
+  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
+    stderr(`idempotency-key: ${idempotencyKey}`);
+  }
+
+  if (opts.dryRun) {
+    const sample: CliProjectAutoAuthResponse = {
+      projectId: opts.projectId,
+      enabled,
+      method: opts.method,
+      inject: opts.inject,
+    };
+    out.print(sample, data => renderAutoAuthText(data as CliProjectAutoAuthResponse));
+    return sample;
+  }
+
+  const client = makeClient(opts, deps);
+  const res = await client.put<CliProjectAutoAuthResponse>(
+    `/projects/${encodeURIComponent(opts.projectId)}/auto-auth`,
+    { body, headers: { 'idempotency-key': idempotencyKey } },
+  );
+  out.print(res, data => renderAutoAuthText(data as CliProjectAutoAuthResponse));
+  return res;
+}
+
+function renderAutoAuthText(r: CliProjectAutoAuthResponse): string {
+  const lines = [
+    `projectId ${r.projectId}`,
+    `enabled   ${r.enabled}`,
+    `method    ${r.method}`,
+    `inject    ${r.inject}`,
+  ];
+  if (r.lastRefreshError) {
+    lines.push(`lastRefreshError ${r.lastRefreshError}`);
+  }
+  // A disabled result after a write means the trial login failed — call it out
+  // so the user doesn't assume auto-auth is live.
+  if (!r.enabled) {
+    lines.push(
+      'note      auto-auth was stored but is DISABLED — the trial login failed. Fix the credentials (e.g. a valid refresh token) and re-run.',
+    );
+  }
+  return lines.join('\n');
+}
+
 export function createProjectCommand(deps: ProjectDeps = {}): Command {
   const project = new Command('project').description('Manage TestSprite projects');
 
@@ -371,6 +669,8 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .option('--page-size <n>', 'service page-size hint (1-100, default 25)')
     .option('--starting-token <token>', 'opaque cursor from a previous list response')
     .option('--max-items <n>', 'stop after this many items across auto-paged pages')
+    .option('--columns <list>', 'select/reorder text table columns (comma-separated keys)')
+    .option('--no-header', 'suppress the text table header row')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: ListFlagOpts, command: Command) => {
       // Don't parse numeric flags via Commander — its parser throws a
@@ -384,6 +684,8 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
           pageSize: parseFlag(cmdOpts.pageSize, 'page-size'),
           startingToken: cmdOpts.startingToken,
           maxItems: parseFlag(cmdOpts.maxItems, 'max-items'),
+          columns: cmdOpts.columns,
+          noHeader: cmdOpts.header === false,
         },
         deps,
       );
@@ -403,7 +705,10 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .option('--type <frontend|backend>', 'project type (required)')
     .option('--name <name>', 'project name (required)')
     .option('--url <url>', 'target URL (required for frontend)')
-    .option('--description <text>', 'optional human description')
+    .option(
+      '--description <text>',
+      'not supported — projects have no description (test-level descriptions are set on `test create`)',
+    )
     .option('--username <user>', 'optional auth username')
     .option('--password <pw>', 'optional auth password (use --password-file for non-interactive)')
     .option('--password-file <path>', 'read password from file instead of inline flag')
@@ -448,7 +753,6 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .option('--username <user>', 'new auth username')
     .option('--password <pw>', 'new auth password')
     .option('--password-file <path>', 'read new password from file')
-    .option('--description <text>', 'new description')
     .option('--instruction <text>', 'new FE plan-gen instruction hint')
     .option(
       '--idempotency-key <token>',
@@ -465,8 +769,129 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
           username: cmdOpts.username,
           password: cmdOpts.password,
           passwordFile: cmdOpts.passwordFile,
-          description: cmdOpts.description,
           instruction: cmdOpts.instruction,
+          idempotencyKey: cmdOpts.idempotencyKey,
+        },
+        deps,
+      );
+    });
+
+  project
+    .command('delete <project-id>')
+    .description(
+      'Permanently delete a project and everything under it (sub-projects,\n' +
+        'their tests, and backend fixtures). Requires --confirm.\n' +
+        '\nExit codes:\n' +
+        '  0  success\n' +
+        '  3  auth error\n' +
+        '  4  project not found (or already deleted)\n' +
+        '  5  validation error (e.g., missing --confirm)',
+    )
+    .option('--confirm', 'required: explicit confirmation for the destructive operation', false)
+    .option(
+      '--idempotency-key <token>',
+      'opaque idempotency token. Defaults to a UUIDv4 minted per invocation.',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (projectId: string, cmdOpts: DeleteFlagOpts, command: Command) => {
+      await runDelete(
+        {
+          ...resolveCommonOptions(command),
+          projectId,
+          confirm: cmdOpts.confirm === true,
+          idempotencyKey: cmdOpts.idempotencyKey,
+        },
+        deps,
+      );
+    });
+
+  project
+    .command('credential <project-id>')
+    .description(
+      'Set the static backend credential injected into every backend test\n' +
+        '(Bearer token / API key / Basic token / public). Free tier.',
+    )
+    .requiredOption('--type <type>', 'public | "Bearer token" | "API key" | "basic token"')
+    .option('--credential <value>', 'credential value (required unless --type public)')
+    .option('--credential-file <path>', 'read the credential value from a file')
+    .option(
+      '--idempotency-key <token>',
+      'opaque idempotency token. Defaults to a UUIDv4 minted per invocation.',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (projectId: string, cmdOpts: CredentialFlagOpts, command: Command) => {
+      await runCredential(
+        {
+          ...resolveCommonOptions(command),
+          projectId,
+          authType: cmdOpts.type,
+          credential: cmdOpts.credential,
+          credentialFile: cmdOpts.credentialFile,
+          idempotencyKey: cmdOpts.idempotencyKey,
+        },
+        deps,
+      );
+    });
+
+  project
+    .command('auto-auth <project-id>')
+    .description(
+      'Configure the recurring-token (auto-refresh login) for backend tests (Pro).\n' +
+        'A fresh token is fetched on each run and injected into every backend test.',
+    )
+    .requiredOption('--method <method>', 'password | refresh_token | aws_cognito_refresh')
+    .requiredOption('--inject <where>', 'bearer | header | cookie')
+    .option('--disable', 'turn auto-auth off (keeps stored config)')
+    .option('--inject-key <name>', 'header/cookie name when --inject is header/cookie')
+    // password method
+    .option('--login-url <url>', 'login endpoint (method=password)')
+    .option('--login-method <verb>', 'POST | PUT (method=password)')
+    .option('--login-content-type <ct>', 'application/json | application/x-www-form-urlencoded')
+    .option('--login-body-template <tpl>', 'login body template with {{username}}/{{password}}')
+    .option('--username <user>', 'login username (method=password)')
+    .option('--password <pw>', 'login password (method=password)')
+    .option('--password-file <path>', 'read login password from a file')
+    .option('--token-path <jsonpath>', 'JSONPath to the token in the login response')
+    // refresh_token method
+    .option('--token-endpoint <url>', 'OAuth token endpoint (method=refresh_token)')
+    .option('--client-id <id>', 'OAuth client id')
+    .option('--client-secret <secret>', 'OAuth client secret')
+    .option('--client-secret-file <path>', 'read OAuth client secret from a file')
+    .option('--refresh-token <token>', 'OAuth/Cognito refresh token')
+    .option('--refresh-token-file <path>', 'read the refresh token from a file')
+    .option('--scope <scope>', 'OAuth scope')
+    // aws_cognito_refresh method
+    .option('--region <region>', "AWS region (method=aws_cognito_refresh, e.g. 'us-east-1')")
+    .option(
+      '--idempotency-key <token>',
+      'opaque idempotency token. Defaults to a UUIDv4 minted per invocation.',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (projectId: string, cmdOpts: AutoAuthFlagOpts, command: Command) => {
+      await runAutoAuth(
+        {
+          ...resolveCommonOptions(command),
+          projectId,
+          disable: cmdOpts.disable,
+          method: cmdOpts.method,
+          inject: cmdOpts.inject,
+          injectKey: cmdOpts.injectKey,
+          loginUrl: cmdOpts.loginUrl,
+          loginMethod: cmdOpts.loginMethod,
+          loginContentType: cmdOpts.loginContentType,
+          loginBodyTemplate: cmdOpts.loginBodyTemplate,
+          username: cmdOpts.username,
+          password: cmdOpts.password,
+          passwordFile: cmdOpts.passwordFile,
+          tokenPath: cmdOpts.tokenPath,
+          tokenEndpoint: cmdOpts.tokenEndpoint,
+          clientId: cmdOpts.clientId,
+          clientSecret: cmdOpts.clientSecret,
+          clientSecretFile: cmdOpts.clientSecretFile,
+          refreshToken: cmdOpts.refreshToken,
+          refreshTokenFile: cmdOpts.refreshTokenFile,
+          scope: cmdOpts.scope,
+          region: cmdOpts.region,
           idempotencyKey: cmdOpts.idempotencyKey,
         },
         deps,
@@ -480,6 +905,8 @@ interface ListFlagOpts {
   pageSize?: string;
   startingToken?: string;
   maxItems?: string;
+  columns?: string;
+  header?: boolean;
 }
 
 interface CreateFlagOpts {
@@ -500,8 +927,43 @@ interface UpdateFlagOpts {
   username?: string;
   password?: string;
   passwordFile?: string;
-  description?: string;
   instruction?: string;
+  idempotencyKey?: string;
+}
+
+interface DeleteFlagOpts {
+  confirm?: boolean;
+  idempotencyKey?: string;
+}
+
+interface CredentialFlagOpts {
+  type: string;
+  credential?: string;
+  credentialFile?: string;
+  idempotencyKey?: string;
+}
+
+interface AutoAuthFlagOpts {
+  disable?: boolean;
+  method: string;
+  inject: string;
+  injectKey?: string;
+  loginUrl?: string;
+  loginMethod?: string;
+  loginContentType?: string;
+  loginBodyTemplate?: string;
+  username?: string;
+  password?: string;
+  passwordFile?: string;
+  tokenPath?: string;
+  tokenEndpoint?: string;
+  clientId?: string;
+  clientSecret?: string;
+  clientSecretFile?: string;
+  refreshToken?: string;
+  refreshTokenFile?: string;
+  scope?: string;
+  region?: string;
   idempotencyKey?: string;
 }
 
@@ -551,45 +1013,37 @@ function makeOutput(mode: OutputMode, deps: ProjectDeps): Output {
   return new Output(mode, { stdout: deps.stdout, stderr: deps.stderr });
 }
 
-function renderProjectListText(page: Page<CliProject>): string {
+const PROJECT_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliProject>> = [
+  {
+    header: 'ID',
+    width: rows => Math.max(2, ...rows.map(project => project.id.length)),
+    render: project => project.id,
+  },
+  {
+    header: 'NAME',
+    width: rows => Math.max(4, ...rows.map(project => project.name.length)),
+    render: project => project.name,
+  },
+  { header: 'TYPE', width: 8, render: project => project.type },
+  { header: 'FROM', width: 6, render: project => project.createdFrom },
+  { header: 'CREATED', width: 0, render: project => project.createdAt },
+];
+
+function renderProjectListText(
+  page: Page<CliProject>,
+  options: { columns?: string; noHeader?: boolean } = {},
+): string {
   if (page.items.length === 0) {
     return page.nextToken
       ? `No projects on this page.\nnextToken: ${page.nextToken}`
       : 'No projects.';
   }
-  // Compact, AWS-CLI-grade columnar output. Column widths are computed
-  // per-call so a single absurdly long project name doesn't push the
-  // whole table off-screen.
-  const idWidth = Math.max(2, ...page.items.map(p => p.id.length));
-  const nameWidth = Math.max(4, ...page.items.map(p => p.name.length));
-  const typeWidth = 8;
-  const fromWidth = 6;
-
-  const header =
-    pad('ID', idWidth) +
-    '  ' +
-    pad('NAME', nameWidth) +
-    '  ' +
-    pad('TYPE', typeWidth) +
-    '  ' +
-    pad('FROM', fromWidth) +
-    '  ' +
-    'CREATED';
-
-  const rows = page.items.map(
-    p =>
-      pad(p.id, idWidth) +
-      '  ' +
-      pad(p.name, nameWidth) +
-      '  ' +
-      pad(p.type, typeWidth) +
-      '  ' +
-      pad(p.createdFrom, fromWidth) +
-      '  ' +
-      p.createdAt,
-  );
-
-  const lines = [header, ...rows];
+  const lines = [
+    renderTextTable(page.items, PROJECT_LIST_COLUMNS, {
+      columns: options.columns,
+      noHeader: options.noHeader,
+    }),
+  ];
   if (page.nextToken) lines.push('', `nextToken: ${page.nextToken}`);
   return lines.join('\n');
 }
@@ -605,17 +1059,16 @@ function renderProjectText(p: CliProject): string {
   ].join('\n');
 }
 
-function pad(s: string, width: number): string {
-  if (s.length >= width) return s;
-  return s + ' '.repeat(width - s.length);
-}
-
 function renderUpdateText(r: CliUpdateProjectResponse): string {
   return [
     `id:            ${r.id}`,
     `updatedFields: ${r.updatedFields?.join(', ') ?? '(none)'}`,
     `updatedAt:     ${r.updatedAt}`,
   ].join('\n');
+}
+
+function renderDeleteText(r: CliDeleteProjectResponse): string {
+  return [`projectId ${r.projectId}`, `deletedAt ${r.deletedAt}`].join('\n');
 }
 
 function localValidationError(message: string): ApiError {

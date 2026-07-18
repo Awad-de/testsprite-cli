@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { ErrorCode } from './errors.js';
-import { ApiError, RequestTimeoutError, TransportError } from './errors.js';
+import { ApiError, InterruptError, RequestTimeoutError, TransportError } from './errors.js';
 import { VERSION } from '../version.js';
 import type {
   TriggerRunBody,
@@ -14,6 +14,7 @@ import type {
   BatchRunFreshResponse,
   ListRunsQuery,
   ListRunsResponse,
+  CancelRunResponse,
 } from './runs.types.js';
 
 export type FetchImpl = typeof globalThis.fetch;
@@ -75,6 +76,14 @@ export interface HttpClientOptions {
    */
   onTransition?: (msg: string) => void;
   /**
+   * Optional callback fired with the backend's supported-floor header
+   * (`X-TestSprite-CLI-Min-Version`) when present on a response. Fires on both
+   * success and error responses. The client forwards the value verbatim — it
+   * applies no policy itself; the caller (client-factory) decides whether to
+   * warn the user.
+   */
+  onServerVersion?: (info: { minVersion?: string }) => void;
+  /**
    * Per-request wall-clock timeout in milliseconds applied to every outgoing
    * fetch. The signal fires independently of any caller-supplied signal — the
    * request aborts on whichever fires first.
@@ -87,6 +96,16 @@ export interface HttpClientOptions {
    * request is well within the 120s default.
    */
   requestTimeoutMs?: number;
+  /**
+   * Process-lifetime shutdown signal (DEV-331 piece 1). Composed into every
+   * outgoing fetch so an armed SIGINT/SIGTERM aborts an in-flight request
+   * (a `--wait` long-poll can sit inside a single fetch for minutes) instead
+   * of waiting out its window. Aborts with an `InterruptError` reason, which
+   * is classified before the timeout-vs-caller logic and is never retried or
+   * re-wrapped as `TransportError`. Defaults off; production wiring passes
+   * `globalShutdown.signal` via the client factory.
+   */
+  shutdownSignal?: AbortSignal;
 }
 
 export interface RequestOptions {
@@ -167,17 +186,40 @@ export class HttpClient {
   private readonly random: () => number;
   private readonly onDebug?: (event: DebugEvent) => void;
   private readonly onTransition?: (msg: string) => void;
+  private readonly onServerVersion?: (info: { minVersion?: string }) => void;
   private readonly requestTimeoutMs: number;
+  private readonly shutdownSignal?: AbortSignal;
 
   constructor(options: HttpClientOptions) {
     this.baseUrl = trimTrailingSlash(options.baseUrl);
     this.apiKey = options.apiKey;
+    this.shutdownSignal = options.shutdownSignal;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.sleep = options.sleep ?? defaultSleep;
     this.random = options.random ?? Math.random;
     this.onDebug = options.onDebug;
     this.onTransition = options.onTransition;
+    this.onServerVersion = options.onServerVersion;
     this.requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_DEFAULT_MS;
+  }
+
+  /**
+   * Read the backend's supported-floor header off a response and forward it to
+   * `onServerVersion` when present. Never throws — a bad header must not break
+   * the request. Called on every response (success or error) so the advisory
+   * covers all paths. (The backend advertises only the floor; "latest" is
+   * resolved client-side via the npm update-notice.)
+   */
+  private captureServerVersion(response: Response): void {
+    if (!this.onServerVersion) return;
+    try {
+      const minVersion = response.headers.get('x-testsprite-cli-min-version') ?? undefined;
+      if (minVersion !== undefined) {
+        this.onServerVersion({ minVersion });
+      }
+    } catch {
+      // Header parsing is best-effort; never let it affect the request.
+    }
   }
 
   async get<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -383,6 +425,24 @@ export class HttpClient {
   }
 
   /**
+   * POST /api/cli/v1/runs/{runId}/cancel
+   * User-initiated cancel of a queued/running run (DEV-331 piece 3). No
+   * body, no `Idempotency-Key` — the endpoint is naturally idempotent (D10):
+   * re-cancel → 200 `alreadyCancelled: true`; already-terminal (passed/
+   * failed/blocked) → 409 CONFLICT; unknown/cross-tenant runId → 404.
+   *
+   * `retryOnConflict: false` — same rationale as `triggerRun`: a 409 here is
+   * a truthful terminal answer ("already finished"), not a transient
+   * snapshot conflict to paper over with a retry.
+   */
+  async cancelRun(runId: string, options?: { signal?: AbortSignal }): Promise<CancelRunResponse> {
+    return this.post<CancelRunResponse>(`/runs/${encodeURIComponent(runId)}/cancel`, {
+      signal: options?.signal,
+      retryOnConflict: false,
+    });
+  }
+
+  /**
    * Classify an error thrown while issuing OR reading a request. When it is an
    * abort/timeout and our per-request timeout signal fired (and the caller had
    * not already aborted), surface a clear RequestTimeoutError; when it is a
@@ -397,6 +457,14 @@ export class HttpClient {
     requestId: string,
     effectiveSignal: AbortSignal = timeoutSignal,
   ): void {
+    // A user interrupt (DEV-331) outranks every other classification: once the
+    // shutdown signal fired, whatever error surfaced from the aborted fetch or
+    // body read is the interrupt. Throw its InterruptError reason so the wait
+    // paths can render the honest detach UX — never a RequestTimeoutError, and
+    // never fall through to the transport retry loop.
+    if (this.shutdownSignal?.aborted) {
+      throw this.shutdownSignal.reason;
+    }
     if (isAbortError(err) || isTimeoutError(err)) {
       const timeoutWon =
         timeoutSignal.aborted &&
@@ -419,9 +487,14 @@ export class HttpClient {
 
     const url = buildUrl(this.baseUrl, path, options.query);
     const requestId = options.requestId ?? newRequestId();
+    const allowTransportRetry = canRetryTransport(method, options);
 
     let attempt = 0;
     while (true) {
+      // Bail before issuing (or re-issuing after a retry sleep) a request the
+      // user has already interrupted; the composed signal below would abort it
+      // immediately anyway, this just skips the wasted dispatch.
+      if (this.shutdownSignal?.aborted) throw this.shutdownSignal.reason;
       attempt += 1;
       this.debug({ kind: 'request', method, url, attempt, requestId });
       const startedAt = Date.now();
@@ -436,8 +509,14 @@ export class HttpClient {
       // long-poll window (<=25s via ?waitSeconds), so it never bites polling.
       const requestTimeout = createRequestTimeout(this.requestTimeoutMs);
       const timeoutSignal = requestTimeout.signal;
+      const composedSignals = [timeoutSignal];
+      if (options.signal != null) composedSignals.push(options.signal);
+      // Shutdown composition (DEV-331): an armed SIGINT/SIGTERM aborts the
+      // in-flight fetch immediately (reason: InterruptError) instead of
+      // letting a long-poll drain its window before the interrupt surfaces.
+      if (this.shutdownSignal != null) composedSignals.push(this.shutdownSignal);
       const effectiveSignal =
-        options.signal != null ? AbortSignal.any([timeoutSignal, options.signal]) : timeoutSignal;
+        composedSignals.length > 1 ? AbortSignal.any(composedSignals) : timeoutSignal;
 
       try {
         try {
@@ -455,6 +534,13 @@ export class HttpClient {
           // A caller-supplied abort sets `name === 'AbortError'`.
           // We treat both abort variants together: if the timeout signal fired and
           // the caller hadn't already aborted, surface a clear RequestTimeoutError.
+          // A user interrupt is never retried and never re-wrapped as a
+          // TransportError (same passthrough discipline as RequestTimeoutError).
+          // The instanceof check matters even without `this.shutdownSignal`:
+          // the polling path composes the shutdown signal into its per-
+          // iteration caller signal, so the fetch can reject with the
+          // InterruptError reason directly (DEV-331).
+          if (err instanceof InterruptError) throw err;
           // A timeout/abort during the fetch itself: classify it (RequestTimeoutError
           // when our deadline fired; otherwise rethrow the caller's abort unmodified).
           this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
@@ -472,7 +558,9 @@ export class HttpClient {
             errorCode: 'TRANSPORT',
             durationMs: Date.now() - startedAt,
           });
-          const decision = transportRetryDecision(attempt, this.random);
+          const decision = allowTransportRetry
+            ? transportRetryDecision(attempt, this.random)
+            : { retry: false, delayMs: 0 };
           if (!decision.retry) throw new TransportError(message, requestId);
           this.transition(
             `Network error on ${shortPath(path)} — retrying in ${Math.round(decision.delayMs / 1000)}s (attempt ${attempt})`,
@@ -487,11 +575,15 @@ export class HttpClient {
             delayMs: decision.delayMs,
           });
           requestTimeout.clear();
-          await this.sleep(decision.delayMs);
+          await this.sleepBeforeRetry(decision.delayMs);
           continue;
         }
 
         const durationMs = Date.now() - startedAt;
+        // Surface the backend version-compatibility headers on every response
+        // (success or error) before branching, so the caller's advisory covers
+        // all paths.
+        this.captureServerVersion(response);
         if (response.ok) {
           this.debug({
             kind: 'response',
@@ -505,6 +597,8 @@ export class HttpClient {
           try {
             return { body: (await response.json()) as T, requestId, status: response.status };
           } catch (err) {
+            // Interrupt passthrough (see the fetch catch above).
+            if (err instanceof InterruptError) throw err;
             // A timeout/abort can fire mid-body-read (headers received, stream stalls).
             this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
             // Otherwise the successful response body was not valid JSON — a
@@ -521,6 +615,8 @@ export class HttpClient {
         try {
           rawBody = await safeReadJson(response);
         } catch (err) {
+          // Interrupt passthrough (see the fetch catch above).
+          if (err instanceof InterruptError) throw err;
           // safeReadJson rethrows aborts/timeouts (it swallows only non-abort parse
           // errors), so a timeout fired mid-body-read on a non-OK response lands here.
           this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
@@ -528,9 +624,9 @@ export class HttpClient {
         }
 
         // Edge proxies / load balancers return 408/502/504 without our error
-        // envelope on transient outages. Per the CLI error spec §7 these are
-        // transport-level retries, not facade errors — fold them in here so
-        // we get the bounded backoff budget instead of a single INTERNAL bail.
+        // envelope on transient outages. These are transport-level retries,
+        // not facade errors — fold them in here so we get the bounded backoff
+        // budget instead of a single INTERNAL bail.
         if (rawBody === null && isTransportEdgeStatus(response.status)) {
           this.debug({
             kind: 'error',
@@ -542,7 +638,9 @@ export class HttpClient {
             errorCode: 'TRANSPORT',
             durationMs,
           });
-          const decision = transportRetryDecision(attempt, this.random);
+          const decision = allowTransportRetry
+            ? transportRetryDecision(attempt, this.random)
+            : { retry: false, delayMs: 0 };
           if (!decision.retry) {
             throw new TransportError(`HTTP ${response.status} from ${url}`, requestId);
           }
@@ -559,7 +657,7 @@ export class HttpClient {
             delayMs: decision.delayMs,
           });
           requestTimeout.clear();
-          await this.sleep(decision.delayMs);
+          await this.sleepBeforeRetry(decision.delayMs);
           continue;
         }
 
@@ -624,7 +722,7 @@ export class HttpClient {
           delayMs: decision.delayMs,
         });
         requestTimeout.clear();
-        await this.sleep(decision.delayMs);
+        await this.sleepBeforeRetry(decision.delayMs);
       } finally {
         requestTimeout.clear();
       }
@@ -650,6 +748,33 @@ export class HttpClient {
       }
     }
     return headers;
+  }
+
+  /**
+   * Retry-delay sleep that bails the moment the shutdown signal fires
+   * (DEV-331, codex finding 1): a RATE_LIMITED `Retry-After: 60` or a
+   * transport backoff must not delay the honest-detach exit by up to a
+   * minute — reject with the InterruptError reason immediately. Mirrors
+   * poll.ts::sleepUnlessInterrupted.
+   */
+  private sleepBeforeRetry(ms: number): Promise<void> {
+    const signal = this.shutdownSignal;
+    if (signal == null) return this.sleep(ms);
+    if (signal.aborted) return Promise.reject(signal.reason);
+    return new Promise((resolve, reject) => {
+      const onAbort = (): void => reject(signal.reason);
+      signal.addEventListener('abort', onAbort, { once: true });
+      this.sleep(ms).then(
+        () => {
+          signal.removeEventListener('abort', onAbort);
+          resolve();
+        },
+        err => {
+          signal.removeEventListener('abort', onAbort);
+          reject(err instanceof Error ? err : new Error(String(err)));
+        },
+      );
+    });
   }
 
   private debug(event: DebugEvent): void {
@@ -825,6 +950,20 @@ function transportRetryDecision(attempt: number, random: () => number): RetryDec
   return { retry: true, delayMs: backoffDelay(attempt, random) };
 }
 
+function canRetryTransport(method: string, options: RequestOptions): boolean {
+  return isIdempotentMethod(method) || hasIdempotencyKey(options.headers);
+}
+
+function isIdempotentMethod(method: string): boolean {
+  const normalized = method.toUpperCase();
+  return normalized === 'GET' || normalized === 'HEAD';
+}
+
+function hasIdempotencyKey(headers: Record<string, string> | undefined): boolean {
+  if (!headers) return false;
+  return Object.keys(headers).some(name => name.toLowerCase() === 'idempotency-key');
+}
+
 function apiRetryDecision(
   code: ErrorCode,
   attempt: number,
@@ -856,6 +995,9 @@ function apiRetryDecision(
     case 'UNSUPPORTED':
     case 'INSUFFICIENT_CREDITS':
     case 'FEATURE_GATED':
+    case 'CLIENT_TOO_OLD':
+      // CLIENT_TOO_OLD: retrying re-sends the same too-old client — it can only
+      // self-heal by upgrading, so fail fast with the upgrade guidance.
       return { retry: false, delayMs: 0 };
     case 'CONFLICT':
       // Read paths (e.g. GET /failure) retry once: 409 = mid-mutation snapshot.

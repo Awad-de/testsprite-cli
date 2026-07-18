@@ -9,8 +9,9 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Command } from 'commander';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { CLIError } from '../lib/errors.js';
+import { ApiError, CLIError } from '../lib/errors.js';
 import { writeProfile } from '../lib/credentials.js';
 import type { DoctorDeps, DoctorReport } from './doctor.js';
 import { createDoctorCommand, runDoctor } from './doctor.js';
@@ -56,6 +57,14 @@ function healthyDeps(credentialsPath: string, extra: Partial<DoctorDeps> = {}): 
   };
 }
 
+function makeDoctorProgram(deps: DoctorDeps = {}): Command {
+  const program = new Command();
+  program.exitOverride();
+  program.option('--output <mode>', 'output', 'text');
+  program.addCommand(createDoctorCommand(deps));
+  return program;
+}
+
 let credentialsPath: string;
 
 beforeEach(() => {
@@ -76,6 +85,51 @@ describe('runDoctor — healthy environment', () => {
     expect(out).toContain('[OK]');
     expect(out).toContain('All checks passed.');
     expect(out).toContain('reached GET /me');
+  });
+
+  it('adds a Routing check (v3) and the gap advisory when /me reports v3Enabled', async () => {
+    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...healthyDeps(credentialsPath, {
+          fetchImpl: makeFetch({ ...OK_ME, v3Enabled: true }),
+        }),
+        ...deps,
+      },
+    );
+    expect(report.failures).toBe(0);
+    expect(report.checks.some(c => c.name === 'Routing' && c.detail.includes('v3'))).toBe(true);
+    expect(capture.stderr.join('\n')).toContain('[advisory]');
+    expect(capture.stderr.join('\n')).toContain('test cancel');
+  });
+
+  it('shows Routing v2 and no advisory when v3Enabled is false', async () => {
+    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...healthyDeps(credentialsPath, {
+          fetchImpl: makeFetch({ ...OK_ME, v3Enabled: false }),
+        }),
+        ...deps,
+      },
+    );
+    expect(report.checks.some(c => c.name === 'Routing' && c.detail.includes('v2'))).toBe(true);
+    expect(capture.stderr.join('\n')).not.toContain('[advisory]');
+  });
+
+  it('omits the Routing check when /me does not report v3Enabled', async () => {
+    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    const { deps } = makeCapture();
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      { ...healthyDeps(credentialsPath), ...deps }, // OK_ME has no v3Enabled
+    );
+    expect(report.checks.some(c => c.name === 'Routing')).toBe(false);
+    expect(report.warnings).toBe(0);
   });
 
   it('never prints the API key anywhere in the report', async () => {
@@ -225,5 +279,37 @@ describe('createDoctorCommand wiring', () => {
 
   it('--help describes the diagnostic', () => {
     expect(createDoctorCommand().helpInformation()).toContain('Diagnose');
+  });
+
+  it('rejects invalid --output with the shared VALIDATION_ERROR', async () => {
+    const rejection = await makeDoctorProgram()
+      .parseAsync(['node', 'ts', '--output', 'yaml', 'doctor'])
+      .catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(ApiError);
+    expect(rejection).toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      nextAction: 'Flag `--output` is invalid: must be one of: json, text.',
+    });
+  });
+
+  it('accepts valid --output modes through command wiring', async () => {
+    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    for (const mode of ['text', 'json'] as const) {
+      const { capture, deps } = makeCapture();
+      await makeDoctorProgram({ ...healthyDeps(credentialsPath), ...deps }).parseAsync([
+        'node',
+        'ts',
+        '--output',
+        mode,
+        'doctor',
+      ]);
+      const raw = capture.stdout.join('');
+      if (mode === 'json') {
+        expect((JSON.parse(raw) as DoctorReport).failures).toBe(0);
+      } else {
+        expect(raw).toContain('All checks passed.');
+      }
+    }
   });
 });

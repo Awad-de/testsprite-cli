@@ -21,6 +21,17 @@ Run the loop only once the change is live somewhere reachable (e.g. open the PR,
 let CI deploy the preview/staging environment) and pass that URL as
 `--target-url`. Running earlier verifies the previous build, not your change.
 
+This CLI only tests a reachable deployed URL (it rejects localhost). If the
+change is only running locally and isn't deployed anywhere reachable yet:
+
+- if the TestSprite MCP is available in this environment, hand off to it — it
+  tunnels your local server and tests the running app;
+- otherwise report the change as unverified-because-undeployed and stop — don't
+  run against a stale deployment to manufacture a verdict.
+
+If the user explicitly named a tool (the CLI or the MCP), honor that over this
+reachability heuristic.
+
 ## When to skip
 
 The skip list is narrow:
@@ -56,13 +67,13 @@ because <X>. Treat this as unverified until that's resolved." Don't claim done.
 
 ```bash
 testsprite --version              # CLI installed?
-testsprite auth whoami            # credentials configured?
+testsprite auth status            # credentials configured?
 ```
 
 - `--version` fails → the CLI isn't installed. Tell the user to install the
   TestSprite CLI (see the TestSprite docs) and stop; don't install it for them.
-- `auth whoami` fails → no credentials. Tell the user they can run
-  `testsprite auth configure`, then stop.
+- `auth status` fails → no credentials. Tell the user they can run
+  `testsprite setup`, then stop.
 
 ## 2. Find the project
 
@@ -165,6 +176,39 @@ only the Python **standard library + `requests` + `pytest` + `numpy` + `scipy`**
 - Get values from the API's responses (and captured variables), not by importing and
   calling the app's internals.
 
+**Authentication — read the injected credential, NEVER hardcode any credential.** This
+applies to **every** secret the API needs — Bearer/JWT tokens **and** API keys, basic-auth
+blobs, session cookies. Do not paste a literal `Bearer …`, `sk-…`, `x-api-key` value, or any
+other credential into the test. Before your script runs, TestSprite prepends a managed
+credential block built from the project's Authentication settings, and `__AUTH_HEADERS__`
+already contains the right header(s) for the configured auth type:
+
+```python
+# Auto-injected credentials — do not modify
+__AUTH_CREDENTIAL__ = "..."
+__AUTH_TYPE__       = "Bearer token"            # or "API key" / "basic token" / "public"
+__AUTH_HEADERS__    = {"Authorization": "Bearer ..."}   # API key → {"X-API-Key": "..."}; basic → {"Authorization": "Basic ..."}
+```
+
+Spread `__AUTH_HEADERS__` into every authenticated request — it adapts to whatever auth type
+the project is configured for, so the same line works for Bearer, API-key, or basic auth:
+
+```python
+r = requests.get(f"{TARGET_URL}/profile", headers={**__AUTH_HEADERS__})
+```
+
+Configure the credential **once on the project** (ask the user for the value — never invent
+or reuse a key you happened to see), and the block stays correct + refreshable:
+
+- **Bearer / API key / basic (static):**
+  `testsprite project credential <projectId> --type "Bearer token"|"API key"|"basic token" --credential <value>`
+- **Auto-refreshing login (recurring token):** `testsprite project auto-auth <projectId> …`
+
+A hardcoded token expires within hours (and a hardcoded key can't be rotated centrally), so
+the test breaks on later runs; the managed block is rewritten with a fresh value each run.
+`test create` emits a `[warn]` when it detects an inlined credential literal — treat that as
+a must-fix, not a nuisance.
+
 **Backend tests that share state declare dependencies at create time.** For a
 one-off verification, prefer a single self-contained script (log in inside the
 same file). But when the coverage set splits naturally into producer → consumer
@@ -192,10 +236,10 @@ testsprite test create --type backend --project <projectId> --name "fixture user
   ordering: trigger the set with `test run --all` (§4) and producers run before
   consumers, `teardown` last. Chaining `run A --wait && run B --wait` yourself
   loses the engine's variable passing and conflicts with concurrent runs.
-- **Declarations are currently create-only.** `test update` cannot amend them and
-  `test get` / `test list` don't echo them back, so note what each test
-  produces/needs as you create it; changing the graph later means delete +
-  recreate.
+- **Declarations are editable.** `test update` amends them (`--produces` /
+  `--needs` / `--category`, repeatable) and `test get` echoes them back —
+  still declare the graph at create time when you can, so wave ordering is
+  right on the first run.
 
 **Show the user the drafted plan / code before creating it** — creating writes to
 their project. One short confirmation; let them edit the tempfile first.

@@ -10,17 +10,23 @@ docs/config and is about to be reported complete.
 Run after a feature or fix lands. Skip only for: docs-only edits, pure
 build/config changes, or when the repo has no TestSprite project linked.
 
+The CLI only tests a reachable deployed URL (it rejects localhost). If the
+change is only running locally, hand off to the TestSprite MCP when it's
+available — it tunnels your local server; otherwise report the change as
+unverified-because-undeployed and stop. If the user explicitly named a tool
+(the CLI or the MCP), honor that over this reachability heuristic.
+
 ## Core loop
 
 ### 1. Preflight
 
 ```bash
 testsprite --version          # CLI installed?
-testsprite auth whoami        # credentials valid?
+testsprite auth status        # credentials valid?
 ```
 
 If `--version` fails, tell the user to install the CLI and stop.
-If `auth whoami` fails, tell the user to run `testsprite auth configure` and stop.
+If `auth status` fails, tell the user to run `testsprite setup` and stop.
 
 ### 2. Find the project
 

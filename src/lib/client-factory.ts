@@ -24,8 +24,11 @@ import {
   REQUEST_TIMEOUT_MAX_MS,
   REQUEST_TIMEOUT_MIN_MS,
 } from './http.js';
+import { globalShutdown } from './interrupt.js';
 import type { OutputMode } from './output.js';
 import { createDryRunFetch } from './dry-run/fetch.js';
+import { noteServerVersion } from './version-notice.js';
+import { VERSION } from '../version.js';
 
 export interface CommonOptions {
   profile: string;
@@ -68,6 +71,12 @@ export interface ClientFactoryDeps {
   credentialsPath?: string;
   fetchImpl?: FetchImpl;
   stderr?: (line: string) => void;
+  /**
+   * Shutdown signal composed into every outgoing fetch (DEV-331 piece 1).
+   * Defaults to `globalShutdown.signal` so an armed SIGINT/SIGTERM aborts an
+   * in-flight request; tests inject their own controller's signal.
+   */
+  shutdownSignal?: AbortSignal;
 }
 
 /**
@@ -252,6 +261,7 @@ export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}
       onDebug: opts.debug ? (event: DebugEvent) => stderr(formatDryRunDebug(event)) : undefined,
       onTransition: opts.verbose ? (msg: string) => stderr(`[verbose] ${msg}`) : undefined,
       requestTimeoutMs,
+      shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
     });
   }
 
@@ -274,7 +284,20 @@ export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}
     fetchImpl: deps.fetchImpl,
     onDebug: opts.debug ? (event: DebugEvent) => stderr(formatDebug(event)) : undefined,
     onTransition: opts.verbose ? (msg: string) => stderr(`[verbose] ${msg}`) : undefined,
+    // Warn once if the backend advertises a minimum supported version above
+    // this binary's. Gating (opt-out env, TTY, output mode, dry-run) lives in
+    // noteServerVersion; the client just forwards the observed headers.
+    onServerVersion: info =>
+      noteServerVersion(info, {
+        currentVersion: VERSION,
+        env,
+        isTTY: process.stderr.isTTY === true,
+        outputMode: opts.output,
+        dryRun: opts.dryRun,
+        stderr,
+      }),
     requestTimeoutMs,
+    shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
   });
 }
 
