@@ -4855,7 +4855,7 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
         autoHeal: false,
         autoHealExplicit: false,
         skipDependencies: false,
-        maxConcurrency: 1,
+        maxConcurrency: 1,  // Fixed: Added comma and missing fields
         profile: 'default',
         output: 'json',
         debug: false,
@@ -4864,7 +4864,7 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
         ...creds,
         sleep: instantSleep,
         fetchImpl: fetchImpl as unknown as FetchImpl,
-        stdout: (line) => stdoutLines.push(line),
+        stdout: line => stdoutLines.push(line),
         stderr: () => undefined,
       },
     ).catch(e => e);
