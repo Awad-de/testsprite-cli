@@ -4855,18 +4855,18 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
         autoHeal: false,
         autoHealExplicit: false,
         skipDependencies: false,
-        maxConcurrency: 1,  // Fixed: Added comma and missing fields
+        maxConcurrency: 1, // تأكدت من وجود الفواصل هنا
         profile: 'default',
         output: 'json',
-        debug: false,
+        debug: false
       },
       {
         ...creds,
         sleep: instantSleep,
         fetchImpl: fetchImpl as unknown as FetchImpl,
         stdout: line => stdoutLines.push(line),
-        stderr: () => undefined,
-      },
+        stderr: () => undefined
+      }
     ).catch(e => e);
 
     expect(err).toMatchObject({ exitCode: 7 });
