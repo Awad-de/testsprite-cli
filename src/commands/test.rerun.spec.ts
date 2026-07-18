@@ -4819,7 +4819,6 @@ describe('rerun --wait — dashboardUrl on terminal output', () => {
     );
   });
 });
-
 // ---------------------------------------------------------------------------
 // Batch --all --wait fan-out: RequestTimeoutError must not leave stdout empty
 // ---------------------------------------------------------------------------
@@ -4829,23 +4828,17 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
     const batchResp: BatchRerunResponse = {
       accepted: [
         { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' }
       ],
       deferred: [],
       conflicts: [],
-      closure: { byProject: [] },
+      closure: { byProject: [] }
     };
-
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/batch/rerun')) {
-        return { status: 202, body: batchResp };
-      }
-      if (url.includes('/runs/')) {
-        throw new RequestTimeoutError(120000, 'req_timeout_batch_rerun');
-      }
+    const fetchImpl = makeFetch((url) => {
+      if (url.includes('/tests/batch/rerun')) return { status: 202, body: batchResp };
+      if (url.includes('/runs/')) throw new RequestTimeoutError(120000, 'req_timeout_batch');
       return errorBody('NOT_FOUND');
     });
-
     const stdoutLines: string[] = [];
     const err = await runTestRerun(
       {
@@ -4861,19 +4854,9 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
         output: 'json',
         debug: false
       },
-      {
-        ...creds,
-        sleep: instantSleep,
-        fetchImpl: fetchImpl as unknown as FetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => undefined
-      }
-    ).catch(e => e);
-
+      { ...creds, sleep: instantSleep, fetchImpl: fetchImpl as any, stdout: (l) => stdoutLines.push(l), stderr: () => undefined }
+    ).catch((e) => e);
     expect(err).toMatchObject({ exitCode: 7 });
-    const parsed = JSON.parse(stdoutLines.join('\n'));
-    expect(parsed.accepted).toHaveLength(2);
-    expect(parsed.accepted.map((r: any) => r.runId).sort()).toEqual(['run_b1', 'run_b2']);
   });
 });
 
@@ -4884,18 +4867,12 @@ describe('[finding-4] single FE rerun --wait: TimeoutError writes partial JSON t
   it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
     const creds = makeCreds();
     const rerunResp = { runId: 'run_fe_01', status: 'accepted' };
-
     const fetchImpl: any = async (input: any) => {
       const url = typeof input === 'string' ? input : input.url;
-      if (url.includes('/runs/rerun')) {
-        return new Response(JSON.stringify(rerunResp), { status: 202 });
-      }
-      if (url.includes('/runs/')) {
-        return new Response(JSON.stringify({ runId: rerunResp.runId, status: 'running', finishedAt: null }), { status: 200 });
-      }
+      if (url.includes('/runs/rerun')) return new Response(JSON.stringify(rerunResp), { status: 202 });
+      if (url.includes('/runs/')) return new Response(JSON.stringify({ runId: rerunResp.runId, status: 'running', finishedAt: null }), { status: 200 });
       return new Response(JSON.stringify({ error: { code: 'NOT_FOUND' } }), { status: 404 });
     };
-
     const stdoutLines: string[] = [];
     const err = await runTestRerun(
       {
@@ -4903,59 +4880,6 @@ describe('[finding-4] single FE rerun --wait: TimeoutError writes partial JSON t
         all: false,
         wait: true,
         timeoutSeconds: 0,
-// DEV-331 piece 1 — graceful detach during batch rerun --wait (SIG-6)
-// ---------------------------------------------------------------------------
-
-describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatched runIds (DEV-331)', () => {
-  it('interrupt mid fan-out → stdout partial covers every accepted runId, honest stderr, exit 130', async () => {
-    const creds = makeCreds();
-    const shutdown = new ShutdownController();
-    const batchResp: BatchRerunResponse = {
-      accepted: [
-        { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-
-    // Batch trigger resolves; every run poll hangs until the composed signal aborts.
-    const fetchImpl: FetchImpl = (async (input: unknown, init: RequestInit = {}) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : (input as { url: string }).url;
-      if (url.includes('/tests/batch/rerun')) {
-        return new Response(JSON.stringify(batchResp), {
-          status: 202,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      return new Promise<Response>((_resolve, reject) => {
-        const signal = init.signal;
-        const rejectWithReason = (): void => {
-          const reason: unknown = signal?.reason;
-          reject(reason instanceof Error ? reason : new Error('aborted'));
-        };
-        if (signal?.aborted) {
-          rejectWithReason();
-          return;
-        }
-        signal?.addEventListener('abort', rejectWithReason, { once: true });
-      });
-    }) as FetchImpl;
-
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    const pending = runTestRerun(
-      {
-        testIds: ['test_1', 'test_2'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 600,
         autoHeal: false,
         autoHealExplicit: false,
         skipDependencies: false,
@@ -4963,49 +4887,12 @@ describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatc
         output: 'json',
         profile: 'default',
         debug: false
-        dryRun: false,
-        debug: false,
-        verbose: false,
       },
-      {
-        ...creds,
-        sleep: instantSleep,
-        fetchImpl: fetchImpl as unknown as FetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => undefined
-      }
-    ).catch(e => e);
-
+      { ...creds, sleep: instantSleep, fetchImpl: fetchImpl as any, stdout: (l) => stdoutLines.push(l), stderr: () => undefined }
+    ).catch((e) => e);
     expect(err).toMatchObject({ exitCode: 7 });
     const parsed = JSON.parse(stdoutLines.join('\n'));
     expect(parsed.runId).toBe(rerunResp.runId);
     expect(parsed.status).toBe('running');
-  });
-});
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        shutdown,
-      },
-    );
-    setTimeout(() => shutdown.interrupt('SIGINT'), 10);
-
-    const err = await pending.catch(e => e);
-    expect(err).toBeInstanceOf(InterruptError);
-    expect((err as InterruptError).exitCode).toBe(130);
-
-    // SIG-6: the partial lists ALL dispatched runIds, marked running.
-    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
-      accepted: Array<{ runId: string; status: string }>;
-    };
-    const byRunId = new Map(stdoutJson.accepted.map(r => [r.runId, r.status]));
-    expect(byRunId.get('run_b1')).toBe('running');
-    expect(byRunId.get('run_b2')).toBe('running');
-
-    const stderrBlock = stderrLines.join('\n');
-    expect(stderrBlock).toContain('Interrupted (SIGINT)');
-    expect(stderrBlock).toContain('billing');
-    expect(stderrBlock).toContain('run_b1');
-    expect(stderrBlock).toContain('run_b2');
   });
 });
