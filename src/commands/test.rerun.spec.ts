@@ -4829,17 +4829,19 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
     const batchResp: BatchRerunResponse = {
       accepted: [
         { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' }
+        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
       ],
       deferred: [],
       conflicts: [],
-      closure: { byProject: [] }
+      closure: { byProject: [] },
     };
+
     const fetchImpl = makeFetch((url) => {
       if (url.includes('/tests/batch/rerun')) return { status: 202, body: batchResp };
-      if (url.includes('/runs/')) throw new RequestTimeoutError(120000, 'req_timeout_batch');
+      if (url.includes('/runs/')) throw new RequestTimeoutError(120000, 'req_timeout_batch_rerun');
       return errorBody('NOT_FOUND');
     });
+
     const stdoutLines: string[] = [];
     const err = await runTestRerun(
       {
@@ -4853,11 +4855,24 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
         maxConcurrency: 1,
         profile: 'default',
         output: 'json',
-        debug: false
+        debug: false,
       },
-      { ...creds, sleep: instantSleep, fetchImpl: fetchImpl as unknown as FetchImpl, stdout: (l) => stdoutLines.push(l), stderr: () => undefined }
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl: fetchImpl as unknown as FetchImpl,
+        stdout: (line) => stdoutLines.push(line),
+        stderr: () => undefined,
+      }
     ).catch((e) => e);
+
     expect(err).toMatchObject({ exitCode: 7 });
+    const parsed = JSON.parse(stdoutLines.join('\n')) as {
+      accepted?: Array<{ testId?: string; runId: string; status?: string }>;
+    };
+    expect(parsed.accepted).toHaveLength(2);
+    expect(parsed.accepted.map((r) => r.runId).sort()).toEqual(['run_b1', 'run_b2']);
+    expect(parsed.accepted.every((r) => r.status === 'timeout')).toBe(true);
   });
 });
 
@@ -4865,15 +4880,27 @@ describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out pol
 // TimeoutError on single FE rerun --wait: partial stdout + exit 7
 // ---------------------------------------------------------------------------
 describe('[finding-4] single FE rerun --wait: TimeoutError writes partial JSON to stdout', () => {
-  it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
+  it('exit 7 AND stdout contains {runId, status:\"running\"} when --timeout polling deadline is exceeded', async () => {
     const creds = makeCreds();
     const rerunResp = { runId: 'run_fe_01', status: 'accepted' };
-    const fetchImpl: FetchImpl = async (input) => {
-      const url = typeof input === 'string' ? input : (input as Request).url;
-      if (url.includes('/runs/rerun')) return new Response(JSON.stringify(rerunResp), { status: 202 });
-      if (url.includes('/runs/')) return new Response(JSON.stringify({ runId: rerunResp.runId, status: 'running', finishedAt: null }), { status: 200 });
+
+    const fetchImpl: FetchImpl = async (input, _init) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+          ? input.toString()
+          : (input as { url: string }).url;
+
+      if (url.includes('/runs/rerun')) {
+        return new Response(JSON.stringify(rerunResp), { status: 202 });
+      }
+      if (url.includes('/runs/')) {
+        return new Response(JSON.stringify({ runId: rerunResp.runId, status: 'running', finishedAt: null }), { status: 200 });
+      }
       return new Response(JSON.stringify({ error: { code: 'NOT_FOUND' } }), { status: 404 });
     };
+
     const stdoutLines: string[] = [];
     const err = await runTestRerun(
       {
@@ -4887,10 +4914,17 @@ describe('[finding-4] single FE rerun --wait: TimeoutError writes partial JSON t
         maxConcurrency: 10,
         output: 'json',
         profile: 'default',
-        debug: false
+        debug: false,
       },
-      { ...creds, sleep: instantSleep, fetchImpl: fetchImpl as unknown as FetchImpl, stdout: (l) => stdoutLines.push(l), stderr: () => undefined }
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl: fetchImpl as unknown as FetchImpl,
+        stdout: (line) => stdoutLines.push(line),
+        stderr: () => undefined,
+      }
     ).catch((e) => e);
+
     expect(err).toMatchObject({ exitCode: 7 });
     const parsed = JSON.parse(stdoutLines.join('\n')) as { runId: string; status: string };
     expect(parsed.runId).toBe(rerunResp.runId);
